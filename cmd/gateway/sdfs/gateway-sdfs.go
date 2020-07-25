@@ -21,7 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
+	"log"
 	"net/http"
 	"os"
 	"os/user"
@@ -32,21 +32,19 @@ import (
 	"time"
 
 	"github.com/colinmarc/hdfs/v2"
-	"github.com/colinmarc/hdfs/v2/hadoopconf"
 	"github.com/minio/cli"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	minio "github.com/minio/minio/cmd"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
-	"github.com/minio/minio/pkg/env"
 	"github.com/minio/minio/pkg/madmin"
 	xnet "github.com/minio/minio/pkg/net"
-	krb "gopkg.in/jcmturner/gokrb5.v7/client"
-	"gopkg.in/jcmturner/gokrb5.v7/config"
-	"gopkg.in/jcmturner/gokrb5.v7/credentials"
 
 	"context"
 	"time"
+
+	spb "github.com/opendedup/sdfs-client-go/sdfs"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -72,7 +70,7 @@ EXAMPLES:
   1. Start minio gateway server for SDFS backend
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_ACCESS_KEY{{.AssignmentOperator}}accesskey
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_SECRET_KEY{{.AssignmentOperator}}secretkey
-     {{.Prompt}} {{.HelpName}} localhost:50051
+     {{.Prompt}} {{.HelpName}} sdfs://localhost:50051
 
   2. Start minio gateway server for SDFS with edge caching enabled
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_ACCESS_KEY{{.AssignmentOperator}}accesskey
@@ -83,7 +81,7 @@ EXAMPLES:
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_AFTER{{.AssignmentOperator}}3
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_WATERMARK_LOW{{.AssignmentOperator}}75
      {{.Prompt}} {{.EnvVarSetCommand}} MINIO_CACHE_WATERMARK_HIGH{{.AssignmentOperator}}85
-     {{.Prompt}} {{.HelpName}} namenode:8200
+     {{.Prompt}} {{.HelpName}} sdfs://localhost:50051
 `
 
 	minio.RegisterGatewayCommand(cli.Command{
@@ -95,152 +93,116 @@ EXAMPLES:
 	})
 }
 
-// Handler for 'minio gateway hdfs' command line.
+// Handler for 'minio gateway sdfs' command line.
 func sdfsGatewayMain(ctx *cli.Context) {
 	// Validate gateway arguments.
 	if ctx.Args().First() == "help" {
 		cli.ShowCommandHelpAndExit(ctx, sdfsBackend, 1)
 	}
 
-	minio.StartGateway(ctx, &HDFS{args: ctx.Args()})
+	minio.StartGateway(ctx, &SDFS{args: ctx.Args()})
 }
 
-// HDFS implements Gateway.
-type HDFS struct {
+// SDFS implements Gateway.
+type SDFS struct {
 	args []string
 }
 
-// Name implements Gateway interface.
-func (g *HDFS) Name() string {
-	return hdfsBackend
+type sdfsError struct {
+	err       string
+	errorCode spb.ErrorCodes
 }
 
-func getKerberosClient() (*krb.Client, error) {
-	cfg, err := config.Load(env.Get("KRB5_CONFIG", "/etc/krb5.conf"))
-	if err != nil {
-		return nil, err
-	}
+func (e *sdfsError) Error() string {
+	return fmt.Sprintf("SDFS Error %s %d", e.err, e.errorCode)
+}
 
-	u, err := user.Current()
-	if err != nil {
-		return nil, err
-	}
-
-	// Determine the ccache location from the environment, falling back to the default location.
-	ccachePath := env.Get("KRB5CCNAME", fmt.Sprintf("/tmp/krb5cc_%s", u.Uid))
-	if strings.Contains(ccachePath, ":") {
-		if strings.HasPrefix(ccachePath, "FILE:") {
-			ccachePath = strings.TrimPrefix(ccachePath, "FILE:")
-		} else {
-			return nil, fmt.Errorf("unable to use kerberos ccache: %s", ccachePath)
-		}
-	}
-
-	ccache, err := credentials.LoadCCache(ccachePath)
-	if err != nil {
-		return nil, err
-	}
-
-	return krb.NewClientFromCCache(ccache, cfg)
+// Name implements Gateway interface.
+func (g *SDFS) Name() string {
+	return sdfsBackend
 }
 
 // NewGatewayLayer returns hdfs gatewaylayer.
-func (g *HDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
-	dialFunc := (&net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-		DualStack: true,
-	}).DialContext
+func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
 
-	hconfig, err := hadoopconf.LoadFromEnvironment()
-	if err != nil {
-		return nil, err
-	}
-
-	opts := hdfs.ClientOptionsFromConf(hconfig)
-	opts.NamenodeDialFunc = dialFunc
-	opts.DatanodeDialFunc = dialFunc
-
+	// Contact the server and print out its response.
 	// Not addresses found, load it from command line.
+	var address string
 	var commonPath string
-	if len(opts.Addresses) == 0 {
-		var addresses []string
-		for _, s := range g.args {
-			u, err := xnet.ParseURL(s)
-			if err != nil {
-				return nil, err
-			}
-			if u.Scheme != "hdfs" {
-				return nil, fmt.Errorf("unsupported scheme %s, only supports hdfs://", u)
-			}
-			if commonPath != "" && commonPath != u.Path {
-				return nil, fmt.Errorf("all namenode paths should be same %s", g.args)
-			}
-			if commonPath == "" {
-				commonPath = u.Path
-			}
-			addresses = append(addresses, u.Host)
+	for _, s := range g.args {
+		u, err := xnet.ParseURL(s)
+		if err != nil {
+			return nil, err
 		}
-		opts.Addresses = addresses
+		if u.Scheme != "sdfs" {
+			return nil, fmt.Errorf("unsupported scheme %s, only supports sdfs://", u)
+		}
+		if commonPath != "" && commonPath != u.Path {
+			return nil, fmt.Errorf("all namenode paths should be same %s", g.args)
+		}
+		if commonPath == "" {
+			commonPath = u.Path
+		}
+		address = u.Host
 	}
 
 	u, err := user.Current()
 	if err != nil {
 		return nil, fmt.Errorf("unable to lookup local user: %s", err)
 	}
-
-	if opts.KerberosClient != nil {
-		opts.KerberosClient, err = getKerberosClient()
-		if err != nil {
-			return nil, fmt.Errorf("unable to initialize kerberos client: %s", err)
-		}
-	} else {
-		opts.User = env.Get("HADOOP_USER_NAME", u.Username)
-	}
-
-	clnt, err := hdfs.NewClient(opts)
+	conn, err := grpc.Dial(address, grpc.WithInsecure(), grpc.WithBlock())
 	if err != nil {
-		return nil, fmt.Errorf("unable to initialize hdfsClient")
+		log.Fatalf("did not connect: %v", err)
+		return nil, fmt.Errorf("unable to initialize sdfsClient")
 	}
+	vc := spb.NewVolumeServiceClient(conn)
+	fc := spb.NewFileIOServiceClient(conn)
 
-	if err = clnt.MkdirAll(minio.PathJoin(commonPath, hdfsSeparator, minioMetaTmpBucket), os.FileMode(0755)); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	r, err := fc.MkDirAll(ctx, &spb.MkDirRequest{
+		Path: minio.PathJoin(commonPath, sdfsSeparator, minioMetaTmpBucket)
+	})
+	if err != nil {
 		return nil, err
+	} else if r.GetErrorCode() > 0 {
+		return nil, &sdfsError{err: r.GetError(),errorCode: r.GetErrorCode()}
 	}
-
-	return &hdfsObjects{clnt: clnt, subPath: commonPath, listPool: minio.NewTreeWalkPool(time.Minute * 30)}, nil
+	return &sdfsObjects{clnt: conn, vc:vc, fc:fc, subPath: commonPath, listPool: minio.NewTreeWalkPool(time.Minute * 30)}, nil
 }
 
 // Production - hdfs gateway is production ready.
-func (g *HDFS) Production() bool {
+func (g *SDFS) Production() bool {
 	return true
 }
 
-func (n *hdfsObjects) Shutdown(ctx context.Context) error {
+func (n *sdfsObjects) Shutdown(ctx context.Context) error {
 	return n.clnt.Close()
 }
 
-func (n *hdfsObjects) StorageInfo(ctx context.Context, _ bool) (si minio.StorageInfo, errs []error) {
-	fsInfo, err := n.clnt.StatFs()
+func (n *sdfsObjects) StorageInfo(ctx context.Context, _ bool) (si minio.StorageInfo, errs []error) {
+	fsInfo, err := n.vc.GetVolumeInfo(ctx,&spb.VolumeInfoRequest{})
 	if err != nil {
 		return minio.StorageInfo{}, []error{err}
 	}
 	si.Disks = []madmin.Disk{{
-		UsedSpace: fsInfo.Used,
+		UsedSpace: fsInfo.GetDseCompSize()
 	}}
 	si.Backend.Type = minio.BackendGateway
-	si.Backend.GatewayOnline = true
+	si.Backend.GatewayOnline = !fsInfo.GetOffline();
 	return si, nil
 }
 
 // hdfsObjects implements gateway for Minio and S3 compatible object storage servers.
-type hdfsObjects struct {
+type sdfsObjects struct {
 	minio.GatewayUnsupported
-	clnt     *hdfs.Client
+	clnt     *grpc.ClientConn
+	vc       spb.VolumeServiceClient
+	fc       spb.FileIOServiceClient
 	subPath  string
 	listPool *minio.TreeWalkPool
 }
 
-func hdfsToObjectErr(ctx context.Context, err error, params ...string) error {
+func sdfsToObjectErr(ctx context.Context, err sdfsError, params ...string) error {
 	if err == nil {
 		return nil
 	}
@@ -258,8 +220,8 @@ func hdfsToObjectErr(ctx context.Context, err error, params ...string) error {
 		bucket = params[0]
 	}
 
-	switch {
-	case os.IsNotExist(err):
+	switch err.errorCode {
+	case spb.ErrorCodes_ENOENT:
 		if uploadID != "" {
 			return minio.InvalidUploadID{
 				UploadID: uploadID,
@@ -269,12 +231,12 @@ func hdfsToObjectErr(ctx context.Context, err error, params ...string) error {
 			return minio.ObjectNotFound{Bucket: bucket, Object: object}
 		}
 		return minio.BucketNotFound{Bucket: bucket}
-	case os.IsExist(err):
+	case spb.ErrorCodes_EEXIST:
 		if object != "" {
 			return minio.PrefixAccessDenied{Bucket: bucket, Object: object}
 		}
 		return minio.BucketAlreadyOwnedByYou{Bucket: bucket}
-	case errors.Is(err, syscall.ENOTEMPTY):
+	case spb.ErrorCodes_ENOTEMPTY:
 		if object != "" {
 			return minio.PrefixAccessDenied{Bucket: bucket, Object: object}
 		}

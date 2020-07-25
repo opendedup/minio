@@ -62,7 +62,7 @@ require (
 	github.com/nats-io/stan.go v0.7.0
 	github.com/ncw/directio v1.0.5
 	github.com/nsqio/go-nsq v1.0.7
-	github.com/opendedup/sdfs-client-go v0.0.0-20200724012838-6a895bb3a65c // indirect
+	github.com/opendedup/sdfs-client-go v0.0.0-20200724181430-daf64385be4d
 	github.com/philhofer/fwd v1.0.0 // indirect
 	github.com/pierrec/lz4 v2.4.0+incompatible
 	github.com/pkg/errors v0.8.1

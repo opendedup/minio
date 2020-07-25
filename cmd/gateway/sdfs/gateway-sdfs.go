@@ -247,64 +247,82 @@ func sdfsToObjectErr(ctx context.Context, err sdfsError, params ...string) error
 	}
 }
 
-// hdfsIsValidBucketName verifies whether a bucket name is valid.
-func hdfsIsValidBucketName(bucket string) bool {
+// sdfsIsValidBucketName verifies whether a bucket name is valid.
+func sdfsIsValidBucketName(bucket string) bool {
 	return s3utils.CheckValidBucketNameStrict(bucket) == nil
 }
 
-func (n *hdfsObjects) hdfsPathJoin(args ...string) string {
-	return minio.PathJoin(append([]string{n.subPath, hdfsSeparator}, args...)...)
+func (n *sdfsObjects) sdfsPathJoin(args ...string) string {
+	return minio.PathJoin(append([]string{n.subPath, sdfsSeparator}, args...)...)
 }
 
-func (n *hdfsObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
-	if !hdfsIsValidBucketName(bucket) {
+func (n *sdfsObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
+	if !sdfsIsValidBucketName(bucket) {
 		return minio.BucketNameInvalid{Bucket: bucket}
 	}
-	if forceDelete {
-		return hdfsToObjectErr(ctx, n.clnt.RemoveAll(n.hdfsPathJoin(bucket)), bucket)
+	rc,err := n.fc.RmDir(ctx,&spb.RmDirRequest{Path: n.sdfsPathJoin(bucket)})
+	
+	if err != null {
+		logger.LogIf(ctx, err)
+		return sdfsToObjectErr(ctx, err, bucket)
+	} else if rc.GetErrorCode() > 0 {
+		return sdfsToObjectErr(ctx,sdfsError{err: rc.GetError(),errorCode: rc.GetErrorCode()}, bucket)
+	} else {
+		return nil
 	}
-	return hdfsToObjectErr(ctx, n.clnt.Remove(n.hdfsPathJoin(bucket)), bucket)
 }
 
-func (n *hdfsObjects) MakeBucketWithLocation(ctx context.Context, bucket string, opts minio.BucketOptions) error {
+func (n *sdfsObjects) MakeBucketWithLocation(ctx context.Context, bucket string, opts minio.BucketOptions) error {
 	if opts.LockEnabled || opts.VersioningEnabled {
 		return minio.NotImplemented{}
 	}
 
-	if !hdfsIsValidBucketName(bucket) {
-		return minio.BucketNameInvalid{Bucket: bucket}
+	rc,err := n.fc.MkDir(ctx,&spb.MkDirRequest{Path: n.sdfsPathJoin(bucket)})
+	
+	if err != null {
+		logger.LogIf(ctx, err)
+		return sdfsToObjectErr(ctx, err, bucket)
+	} else if rc.GetErrorCode() > 0 {
+		return sdfsToObjectErr(ctx,sdfsError{err: rc.GetError(),errorCode: rc.GetErrorCode()}, bucket)
+	} else {
+		return nil
 	}
-	return hdfsToObjectErr(ctx, n.clnt.Mkdir(n.hdfsPathJoin(bucket), os.FileMode(0755)), bucket)
 }
 
-func (n *hdfsObjects) GetBucketInfo(ctx context.Context, bucket string) (bi minio.BucketInfo, err error) {
-	fi, err := n.clnt.Stat(n.hdfsPathJoin(bucket))
-	if err != nil {
-		return bi, hdfsToObjectErr(ctx, err, bucket)
+func (n *sdfsObjects) GetBucketInfo(ctx context.Context, bucket string) (bi minio.BucketInfo, err error) {
+	fi, err := n.fc.GetFileInfo(ctx,&spb.FileInfoRequest{FileName:n.sdfsPathJoin(bucket)})
+	if err != null {
+		logger.LogIf(ctx, err)
+		return sdfsToObjectErr(ctx, err, bucket)
+	} else if fi.GetErrorCode() > 0 {
+		return sdfsToObjectErr(ctx,sdfsError{err: fi.GetError(),errorCode: fi.GetErrorCode()}, bucket)
 	}
 	// As hdfs.Stat() doesn't carry anything other than ModTime(), use ModTime() as CreatedTime.
 	return minio.BucketInfo{
 		Name:    bucket,
-		Created: fi.ModTime(),
+		Created: fi.GetResponse()[0].GetMtime()
 	}, nil
 }
 
-func (n *hdfsObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketInfo, err error) {
-	entries, err := n.clnt.ReadDir(hdfsSeparator)
+func (n *sdfsObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketInfo, err error) {
+	fi, err := n.fc.GetFileInfo(ctx,&spb.FileInfoRequest{FileName:sdfsSeparator})
+	
 	if err != nil {
 		logger.LogIf(ctx, err)
-		return nil, hdfsToObjectErr(ctx, err)
+		return nil, sdfsToObjectErr(ctx, err)
+	} else if fi.GetErrorCode() > 0 {
+		return sdfsToObjectErr(ctx,sdfsError{err: fi.GetError(),errorCode: fi.GetErrorCode()}, bucket)
 	}
-
+	entries := fi.GetResponse() 
 	for _, entry := range entries {
 		// Ignore all reserved bucket names and invalid bucket names.
 		if isReservedOrInvalidBucket(entry.Name(), false) {
 			continue
 		}
 		buckets = append(buckets, minio.BucketInfo{
-			Name: entry.Name(),
+			Name: entry.GetFileName(),
 			// As hdfs.Stat() doesnt carry CreatedTime, use ModTime() as CreatedTime.
-			Created: entry.ModTime(),
+			Created: entry.GetMtime(),
 		})
 	}
 
@@ -313,31 +331,25 @@ func (n *hdfsObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketIn
 	return buckets, nil
 }
 
-func (n *hdfsObjects) listDirFactory() minio.ListDirFunc {
+func (n *sdfsObjects) listDirFactory() minio.ListDirFunc {
 	// listDir - lists all the entries at a given prefix and given entry in the prefix.
 	listDir := func(bucket, prefixDir, prefixEntry string) (emptyDir bool, entries []string) {
-		f, err := n.clnt.Open(n.hdfsPathJoin(bucket, prefixDir))
+		fi, err := n.fc.GetFileInfo(ctx,&spb.FileInfoRequest{FileName:n.sdfsPathJoin(bucket, prefixDir),NumberOfFiles:1000000})
 		if err != nil {
-			if os.IsNotExist(err) {
-				err = nil
-			}
-			logger.LogIf(minio.GlobalContext, err)
-			return
+			logger.LogIf(ctx, err)
+			return nil, sdfsToObjectErr(ctx, err)
+		} else if fi.GetErrorCode() > 0 {
+			return sdfsToObjectErr(ctx,sdfsError{err: fi.GetError(),errorCode: fi.GetErrorCode()}, bucket)
 		}
-		defer f.Close()
-		fis, err := f.Readdir(0)
-		if err != nil {
-			logger.LogIf(minio.GlobalContext, err)
-			return
-		}
-		if len(fis) == 0 {
+		if len(fi.GetResponse()) == 0 {
 			return true, nil
 		}
-		for _, fi := range fis {
-			if fi.IsDir() {
-				entries = append(entries, fi.Name()+hdfsSeparator)
+		fis := fi.GetResponse()
+		for _, fl := range fis {
+			if fl.GetType() == spb.FileInfoResponse_DIR {
+				entries = append(entries, fl.GetFileName()+sdfsSeparator)
 			} else {
-				entries = append(entries, fi.Name())
+				entries = append(entries, fl.GetFileName())
 			}
 		}
 		return false, minio.FilterMatchingPrefix(entries, prefixEntry)
@@ -348,7 +360,7 @@ func (n *hdfsObjects) listDirFactory() minio.ListDirFunc {
 }
 
 // ListObjects lists all blobs in HDFS bucket filtered by prefix.
-func (n *hdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, err error) {
+func (n *sdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, err error) {
 	if _, err := n.clnt.Stat(n.hdfsPathJoin(bucket)); err != nil {
 		return loi, hdfsToObjectErr(ctx, err, bucket)
 	}

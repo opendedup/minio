@@ -321,7 +321,6 @@ func (n *sdfsObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketIn
 		}
 		buckets = append(buckets, minio.BucketInfo{
 			Name: entry.GetFileName(),
-			// As hdfs.Stat() doesnt carry CreatedTime, use ModTime() as CreatedTime.
 			Created: time.Unix(0, entry.GetMtime() * int64(1000000)),
 		})
 	}

@@ -300,7 +300,7 @@ func (n *sdfsObjects) GetBucketInfo(ctx context.Context, bucket string) (bi mini
 	// As hdfs.Stat() doesn't carry anything other than ModTime(), use ModTime() as CreatedTime.
 	return minio.BucketInfo{
 		Name:    bucket,
-		Created: fi.GetResponse()[0].GetMtime()
+		Created: time.Unix(0, fi.GetResponse()[0].GetMtime() * int64(1000000)) 
 	}, nil
 }
 
@@ -322,7 +322,7 @@ func (n *sdfsObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketIn
 		buckets = append(buckets, minio.BucketInfo{
 			Name: entry.GetFileName(),
 			// As hdfs.Stat() doesnt carry CreatedTime, use ModTime() as CreatedTime.
-			Created: entry.GetMtime(),
+			Created: time.Unix(0, entry.GetMtime() * int64(1000000)),
 		})
 	}
 
@@ -334,7 +334,7 @@ func (n *sdfsObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketIn
 func (n *sdfsObjects) listDirFactory() minio.ListDirFunc {
 	// listDir - lists all the entries at a given prefix and given entry in the prefix.
 	listDir := func(bucket, prefixDir, prefixEntry string) (emptyDir bool, entries []string) {
-		fi, err := n.fc.GetFileInfo(ctx,&spb.FileInfoRequest{FileName:n.sdfsPathJoin(bucket, prefixDir),NumberOfFiles:1000000})
+		fi, err := n.fc.GetFileInfo(ctx,&spb.FileInfoRequest{FileName:n.sdfsPathJoin(bucket, prefixDir),NumberOfFiles:1000000,Compact:true})
 		if err != nil {
 			logger.LogIf(ctx, err)
 			return nil, sdfsToObjectErr(ctx, err)
@@ -359,24 +359,39 @@ func (n *sdfsObjects) listDirFactory() minio.ListDirFunc {
 	return listDir
 }
 
-// ListObjects lists all blobs in HDFS bucket filtered by prefix.
+// ListObjects lists all blobs in SDFS bucket filtered by prefix.
 func (n *sdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, err error) {
-	if _, err := n.clnt.Stat(n.hdfsPathJoin(bucket)); err != nil {
+	fi, err := n.fc.FileExists(ctx,&spb.FileExistsRequest{Path:n.sdfsPathJoin(bucket)})
+	if err != nil {
 		return loi, hdfsToObjectErr(ctx, err, bucket)
+	} else if fi.GetErrorCode() > 0 {
+		return lio, sdfsToObjectErr(ctx,sdfsError{err: fi.GetError(),errorCode: fi.GetErrorCode()}, bucket)
+	} else if !fi.GetExists() {
+		return lio, sdfsToObjectErr(ctx,sdfsError{err: "bucket does not exists ["+bucket+"]", errorCode: spb.ErrorCodes_ENOENT}, bucket)
 	}
+	
+
 
 	getObjectInfo := func(ctx context.Context, bucket, entry string) (minio.ObjectInfo, error) {
-		fi, err := n.clnt.Stat(n.hdfsPathJoin(bucket, entry))
+		fl, err := n.fc.GetFileInfo(ctx,&spb.FileInfoRequest{FileName:entry})
+		
 		if err != nil {
-			return minio.ObjectInfo{}, hdfsToObjectErr(ctx, err, bucket, entry)
+			return minio.ObjectInfo{}, sdfsObjectErr(ctx, err, bucket, entry)
+		}else if fl.GetErrorCode() > 0 {
+			return minio.ObjectInfo{}, sdfsToObjectErr(ctx,sdfsError{err: fl.GetError(),errorCode: fl.GetErrorCode()}, bucket)
 		}
+		var dir bool = false;
+		if fl.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR {
+			dir = true
+		}
+
 		return minio.ObjectInfo{
 			Bucket:  bucket,
 			Name:    entry,
-			ModTime: fi.ModTime(),
-			Size:    fi.Size(),
-			IsDir:   fi.IsDir(),
-			AccTime: fi.(*hdfs.FileInfo).AccessTime(),
+			Size:    fl.GetResponse()[0].GetSize(),
+			IsDir:   dir,
+			ModTime: time.Unix(0, fl.GetResponse()[0].GetMtime() * int64(1000000)),
+			AccTime: time.Unix(0, fl.GetResponse()[0].GetAtime() * int64(1000000)),
 		}, nil
 	}
 

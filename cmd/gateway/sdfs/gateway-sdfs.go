@@ -18,7 +18,6 @@ package sdfs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -28,7 +27,6 @@ import (
 	"path"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/colinmarc/hdfs/v2"
@@ -159,15 +157,13 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 	fc := spb.NewFileIOServiceClient(conn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	r, err := fc.MkDirAll(ctx, &spb.MkDirRequest{
-		Path: minio.PathJoin(commonPath, sdfsSeparator, minioMetaTmpBucket)
-	})
+	r, err := fc.MkDirAll(ctx, &spb.MkDirRequest{Path: minio.PathJoin(commonPath, sdfsSeparator, minioMetaTmpBucket)})
 	if err != nil {
 		return nil, err
 	} else if r.GetErrorCode() > 0 {
-		return nil, &sdfsError{err: r.GetError(),errorCode: r.GetErrorCode()}
+		return nil, &sdfsError{err: r.GetError(), errorCode: r.GetErrorCode()}
 	}
-	return &sdfsObjects{clnt: conn, vc:vc, fc:fc, subPath: commonPath, listPool: minio.NewTreeWalkPool(time.Minute * 30)}, nil
+	return &sdfsObjects{clnt: conn, vc: vc, fc: fc, subPath: commonPath, listPool: minio.NewTreeWalkPool(time.Minute * 30)}, nil
 }
 
 // Production - hdfs gateway is production ready.
@@ -180,15 +176,13 @@ func (n *sdfsObjects) Shutdown(ctx context.Context) error {
 }
 
 func (n *sdfsObjects) StorageInfo(ctx context.Context, _ bool) (si minio.StorageInfo, errs []error) {
-	fsInfo, err := n.vc.GetVolumeInfo(ctx,&spb.VolumeInfoRequest{})
+	fsInfo, err := n.vc.GetVolumeInfo(ctx, &spb.VolumeInfoRequest{})
 	if err != nil {
 		return minio.StorageInfo{}, []error{err}
 	}
-	si.Disks = []madmin.Disk{{
-		UsedSpace: fsInfo.GetDseCompSize()
-	}}
+	si.Disks = []madmin.Disk{{UsedSpace: fsInfo.GetDseCompSize()}}
 	si.Backend.Type = minio.BackendGateway
-	si.Backend.GatewayOnline = !fsInfo.GetOffline();
+	si.Backend.GatewayOnline = !fsInfo.GetOffline()
 	return si, nil
 }
 
@@ -247,6 +241,19 @@ func sdfsToObjectErr(ctx context.Context, err sdfsError, params ...string) error
 	}
 }
 
+func genericToObjectErr(ctx context.Context, err Error, params ...string) error {
+	if err == nil {
+		return nil
+	}
+
+	if _, ok := err.(*sdfsError); ok {
+		return sdfsToObjectErr(ctx, err, params)
+	}
+	logger.LogIf(ctx, err)
+	return err
+
+}
+
 // sdfsIsValidBucketName verifies whether a bucket name is valid.
 func sdfsIsValidBucketName(bucket string) bool {
 	return s3utils.CheckValidBucketNameStrict(bucket) == nil
@@ -260,13 +267,13 @@ func (n *sdfsObjects) DeleteBucket(ctx context.Context, bucket string, forceDele
 	if !sdfsIsValidBucketName(bucket) {
 		return minio.BucketNameInvalid{Bucket: bucket}
 	}
-	rc,err := n.fc.RmDir(ctx,&spb.RmDirRequest{Path: n.sdfsPathJoin(bucket)})
-	
+	rc, err := n.fc.RmDir(ctx, &spb.RmDirRequest{Path: n.sdfsPathJoin(bucket)})
+
 	if err != null {
 		logger.LogIf(ctx, err)
 		return sdfsToObjectErr(ctx, err, bucket)
 	} else if rc.GetErrorCode() > 0 {
-		return sdfsToObjectErr(ctx,sdfsError{err: rc.GetError(),errorCode: rc.GetErrorCode()}, bucket)
+		return sdfsToObjectErr(ctx, &sdfsError{err: rc.GetError(), errorCode: rc.GetErrorCode()}, bucket)
 	} else {
 		return nil
 	}
@@ -277,51 +284,47 @@ func (n *sdfsObjects) MakeBucketWithLocation(ctx context.Context, bucket string,
 		return minio.NotImplemented{}
 	}
 
-	rc,err := n.fc.MkDir(ctx,&spb.MkDirRequest{Path: n.sdfsPathJoin(bucket)})
-	
+	rc, err := n.fc.MkDir(ctx, &spb.MkDirRequest{Path: n.sdfsPathJoin(bucket)})
+
 	if err != null {
 		logger.LogIf(ctx, err)
 		return sdfsToObjectErr(ctx, err, bucket)
 	} else if rc.GetErrorCode() > 0 {
-		return sdfsToObjectErr(ctx,sdfsError{err: rc.GetError(),errorCode: rc.GetErrorCode()}, bucket)
+		return sdfsToObjectErr(ctx, sdfsError{err: rc.GetError(), errorCode: rc.GetErrorCode()}, bucket)
 	} else {
 		return nil
 	}
 }
 
 func (n *sdfsObjects) GetBucketInfo(ctx context.Context, bucket string) (bi minio.BucketInfo, err error) {
-	fi, err := n.fc.GetFileInfo(ctx,&spb.FileInfoRequest{FileName:n.sdfsPathJoin(bucket)})
+	fi, err := n.fc.Stat(ctx, &spb.FileInfoRequest{FileName: n.sdfsPathJoin(bucket)})
 	if err != null {
 		logger.LogIf(ctx, err)
 		return sdfsToObjectErr(ctx, err, bucket)
 	} else if fi.GetErrorCode() > 0 {
-		return sdfsToObjectErr(ctx,sdfsError{err: fi.GetError(),errorCode: fi.GetErrorCode()}, bucket)
+		return sdfsToObjectErr(ctx, sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket)
 	}
-	// As hdfs.Stat() doesn't carry anything other than ModTime(), use ModTime() as CreatedTime.
-	return minio.BucketInfo{
-		Name:    bucket,
-		Created: time.Unix(0, fi.GetResponse()[0].GetMtime() * int64(1000000)) 
-	}, nil
+	return minio.BucketInfo{Name: bucket, Created: time.Unix(0, fi.GetResponse()[0].GetCtime()*int64(1000000))}, nil
 }
 
 func (n *sdfsObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketInfo, err error) {
-	fi, err := n.fc.GetFileInfo(ctx,&spb.FileInfoRequest{FileName:sdfsSeparator})
-	
+	fi, err := n.fc.GetFileInfo(ctx, &spb.FileInfoRequest{FileName: sdfsSeparator})
+
 	if err != nil {
 		logger.LogIf(ctx, err)
 		return nil, sdfsToObjectErr(ctx, err)
 	} else if fi.GetErrorCode() > 0 {
-		return sdfsToObjectErr(ctx,sdfsError{err: fi.GetError(),errorCode: fi.GetErrorCode()}, bucket)
+		return sdfsToObjectErr(ctx, sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket)
 	}
-	entries := fi.GetResponse() 
+	entries := fi.GetResponse()
 	for _, entry := range entries {
 		// Ignore all reserved bucket names and invalid bucket names.
 		if isReservedOrInvalidBucket(entry.Name(), false) {
 			continue
 		}
 		buckets = append(buckets, minio.BucketInfo{
-			Name: entry.GetFileName(),
-			Created: time.Unix(0, entry.GetMtime() * int64(1000000)),
+			Name:    entry.GetFileName(),
+			Created: time.Unix(0, entry.GetMtime()*int64(1000000)),
 		})
 	}
 
@@ -333,12 +336,12 @@ func (n *sdfsObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketIn
 func (n *sdfsObjects) listDirFactory() minio.ListDirFunc {
 	// listDir - lists all the entries at a given prefix and given entry in the prefix.
 	listDir := func(bucket, prefixDir, prefixEntry string) (emptyDir bool, entries []string) {
-		fi, err := n.fc.GetFileInfo(ctx,&spb.FileInfoRequest{FileName:n.sdfsPathJoin(bucket, prefixDir),NumberOfFiles:1000000,Compact:true})
+		fi, err := n.fc.GetFileInfo(ctx, &spb.FileInfoRequest{FileName: n.sdfsPathJoin(bucket, prefixDir), NumberOfFiles: 1000000, Compact: true})
 		if err != nil {
 			logger.LogIf(ctx, err)
 			return nil, sdfsToObjectErr(ctx, err)
 		} else if fi.GetErrorCode() > 0 {
-			return sdfsToObjectErr(ctx,sdfsError{err: fi.GetError(),errorCode: fi.GetErrorCode()}, bucket)
+			return sdfsToObjectErr(ctx, sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket)
 		}
 		if len(fi.GetResponse()) == 0 {
 			return true, nil
@@ -360,26 +363,22 @@ func (n *sdfsObjects) listDirFactory() minio.ListDirFunc {
 
 // ListObjects lists all blobs in SDFS bucket filtered by prefix.
 func (n *sdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, err error) {
-	fi, err := n.fc.FileExists(ctx,&spb.FileExistsRequest{Path:n.sdfsPathJoin(bucket)})
+	fi, err := n.fc.FileExists(ctx, &spb.FileExistsRequest{Path: n.sdfsPathJoin(bucket)})
 	if err != nil {
-		return loi, hdfsToObjectErr(ctx, err, bucket)
+		return loi, sdfsToObjectErr(ctx, err, bucket)
 	} else if fi.GetErrorCode() > 0 {
-		return lio, sdfsToObjectErr(ctx,sdfsError{err: fi.GetError(),errorCode: fi.GetErrorCode()}, bucket)
-	} else if !fi.GetExists() {
-		return lio, sdfsToObjectErr(ctx,sdfsError{err: "bucket does not exists ["+bucket+"]", errorCode: spb.ErrorCodes_ENOENT}, bucket)
+		return lio, sdfsToObjectErr(ctx, sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket)
 	}
-	
-
 
 	getObjectInfo := func(ctx context.Context, bucket, entry string) (minio.ObjectInfo, error) {
-		fl, err := n.fc.GetFileInfo(ctx,&spb.FileInfoRequest{FileName:entry})
-		
+		fl, err := n.fc.Stat(ctx, &spb.FileInfoRequest{FileName: entry})
+
 		if err != nil {
 			return minio.ObjectInfo{}, sdfsObjectErr(ctx, err, bucket, entry)
-		}else if fl.GetErrorCode() > 0 {
-			return minio.ObjectInfo{}, sdfsToObjectErr(ctx,sdfsError{err: fl.GetError(),errorCode: fl.GetErrorCode()}, bucket)
+		} else if fl.GetErrorCode() > 0 {
+			return minio.ObjectInfo{}, sdfsToObjectErr(ctx, sdfsError{err: fl.GetError(), errorCode: fl.GetErrorCode()}, bucket)
 		}
-		var dir bool = false;
+		var dir bool = false
 		if fl.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR {
 			dir = true
 		}
@@ -389,8 +388,8 @@ func (n *sdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, d
 			Name:    entry,
 			Size:    fl.GetResponse()[0].GetSize(),
 			IsDir:   dir,
-			ModTime: time.Unix(0, fl.GetResponse()[0].GetMtime() * int64(1000000)),
-			AccTime: time.Unix(0, fl.GetResponse()[0].GetAtime() * int64(1000000)),
+			ModTime: time.Unix(0, fl.GetResponse()[0].GetMtime()*int64(1000000)),
+			AccTime: time.Unix(0, fl.GetResponse()[0].GetAtime()*int64(1000000)),
 		}, nil
 	}
 
@@ -400,35 +399,56 @@ func (n *sdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, d
 // deleteObject deletes a file path if its empty. If it's successfully deleted,
 // it will recursively move up the tree, deleting empty parent directories
 // until it finds one with files in it. Returns nil for a non-empty directory.
-func (n *hdfsObjects) deleteObject(basePath, deletePath string) error {
+func (n *sdfsObjects) deleteObject(ctx context.Context, basePath, deletePath string) error {
 	if basePath == deletePath {
 		return nil
 	}
-
 	// Attempt to remove path.
-	if err := n.clnt.Remove(deletePath); err != nil {
-		if errors.Is(err, syscall.ENOTEMPTY) {
-			// Ignore errors if the directory is not empty. The server relies on
-			// this functionality, and sometimes uses recursion that should not
-			// error on parent directories.
-			return nil
+	fi, err := n.fc.Stat(ctx, &spb.FileInfoRequest{FileName: deletePath})
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return nil
+	} else if fi.GetErrorCode() > 0 {
+		err = sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}
+		logger.LogIf(ctx, err)
+		return nil
+	}
+	if fi.GetResponse()[0].GetType == spb.FileInfoResponse_DIR {
+		fd, err := n.fc.RmDir(ctx, &spb.RmDirRequest{Path: deletePath})
+		if err != nil {
+			return err
+		} else if fd.GetErrorCode() > 0 {
+			if fd.GetErrorCode() == spb.ErrorCodes_ENOTEMPTY {
+				return nil
+			}
+			err = sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}
+			logger.LogIf(ctx, err)
+			return err
 		}
-		return err
+	} else {
+		fd, err := n.fc.Unlink(ctx, &spb.UnlinkRequest{Path: deletePath})
+		if err != nil {
+			return err
+		} else if fd.GetErrorCode() > 0 {
+
+			err = sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}
+			logger.LogIf(ctx, err)
+			return err
+		}
 	}
 
 	// Trailing slash is removed when found to ensure
 	// slashpath.Dir() to work as intended.
-	deletePath = strings.TrimSuffix(deletePath, hdfsSeparator)
+	deletePath = strings.TrimSuffix(deletePath, sdfsSeparator)
 	deletePath = path.Dir(deletePath)
 
 	// Delete parent directory. Errors for parent directories shouldn't trickle down.
-	n.deleteObject(basePath, deletePath)
-
+	n.deleteObject(ctx, basePath, deletePath)
 	return nil
 }
 
-// ListObjectsV2 lists all blobs in HDFS bucket filtered by prefix
-func (n *hdfsObjects) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int,
+// ListObjectsV2 lists all blobs in SDFS bucket filtered by prefix
+func (n *sdfsObjects) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int,
 	fetchOwner bool, startAfter string) (loi minio.ListObjectsV2Info, err error) {
 	// fetchOwner is not supported and unused.
 	marker := continuationToken
@@ -448,15 +468,17 @@ func (n *hdfsObjects) ListObjectsV2(ctx context.Context, bucket, prefix, continu
 	}, nil
 }
 
-func (n *hdfsObjects) DeleteObject(ctx context.Context, bucket, object string, opts minio.ObjectOptions) (minio.ObjectInfo, error) {
-	err := hdfsToObjectErr(ctx, n.deleteObject(n.hdfsPathJoin(bucket), n.hdfsPathJoin(bucket, object)), bucket, object)
+func (n *sdfsObjects) DeleteObject(ctx context.Context, bucket, object string, opts minio.ObjectOptions) (minio.ObjectInfo, error) {
+	err := sdfsToObjectErr(ctx, n.deleteObject(ctx, n.sdfsPathJoin(bucket), n.sdfsPathJoin(bucket, object)), bucket, object)
 	return minio.ObjectInfo{
 		Bucket: bucket,
 		Name:   object,
 	}, err
+
 }
 
-func (n *hdfsObjects) DeleteObjects(ctx context.Context, bucket string, objects []minio.ObjectToDelete, opts minio.ObjectOptions) ([]minio.DeletedObject, []error) {
+func (n *sdfsObjects) DeleteObjects(ctx context.Context, bucket string, objects []minio.ObjectToDelete, opts minio.ObjectOptions) ([]minio.DeletedObject, []error) {
+
 	errs := make([]error, len(objects))
 	dobjects := make([]minio.DeletedObject, len(objects))
 	for idx, object := range objects {
@@ -470,12 +492,11 @@ func (n *hdfsObjects) DeleteObjects(ctx context.Context, bucket string, objects 
 	return dobjects, errs
 }
 
-func (n *hdfsObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *minio.HTTPRangeSpec, h http.Header, lockType minio.LockType, opts minio.ObjectOptions) (gr *minio.GetObjectReader, err error) {
+func (n *sdfsObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *minio.HTTPRangeSpec, h http.Header, lockType minio.LockType, opts minio.ObjectOptions) (gr *minio.GetObjectReader, err error) {
 	objInfo, err := n.GetObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
 		return nil, err
 	}
-
 	var startOffset, length int64
 	startOffset, length, err = rs.GetOffsetLength(objInfo.Size)
 	if err != nil {
@@ -484,7 +505,7 @@ func (n *hdfsObjects) GetObjectNInfo(ctx context.Context, bucket, object string,
 
 	pr, pw := io.Pipe()
 	go func() {
-		nerr := n.GetObject(ctx, bucket, object, startOffset, length, pw, objInfo.ETag, opts)
+		fr, err := n.GetObject(ctx, bucket, object, startOffset, length, pw, objInfo.ETag, opts)
 		pw.CloseWithError(nerr)
 	}()
 
@@ -495,187 +516,229 @@ func (n *hdfsObjects) GetObjectNInfo(ctx context.Context, bucket, object string,
 
 }
 
-func (n *hdfsObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.ObjectInfo, error) {
-	cpSrcDstSame := minio.IsStringEqual(n.hdfsPathJoin(srcBucket, srcObject), n.hdfsPathJoin(dstBucket, dstObject))
+func (n *sdfsObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.ObjectInfo, error) {
+	cpSrcDstSame := minio.IsStringEqual(n.sdfsPathJoin(srcBucket, srcObject), n.sdfsPathJoin(dstBucket, dstObject))
 	if cpSrcDstSame {
 		return n.GetObjectInfo(ctx, srcBucket, srcObject, minio.ObjectOptions{})
 	}
 
-	return n.PutObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, minio.ObjectOptions{
-		ServerSideEncryption: dstOpts.ServerSideEncryption,
-		UserDefined:          srcInfo.UserDefined,
+	fcc, err := n.fc.CreateCopy(ctx, &spb.FileSnapshotRequest{
+		Src:  n.sdfsPathJoin(srcBucket, srcObject),
+		Dest: n.sdfsPathJoin(dstBucket, dstObject),
 	})
+	if err != nil {
+		return objInfo, sdfsToObjectErr(ctx, err, bucket)
+	} else if fcc.GetErrorCode() > 0 {
+		return objInfo, sdfsToObjectErr(ctx, sdfsError{err: fcc.GetError(), errorCode: fcc.GetErrorCode()}, bucket)
+	} else {
+		return n.GetObjectInfo(ctx, dstBucket, dstObject, minio.ObjectOptions{})
+	}
+
 }
 
-func (n *hdfsObjects) GetObject(ctx context.Context, bucket, key string, startOffset, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
-	if _, err := n.clnt.Stat(n.hdfsPathJoin(bucket)); err != nil {
-		return hdfsToObjectErr(ctx, err, bucket)
+func (n *sdfsObjects) GetObject(ctx context.Context, bucket, key string, startOffset int64, length int32, writer io.Writer, etag string, opts minio.ObjectOptions) error {
+	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.PathJoin(bucket)})
+	if err != nil {
+		return sdfsToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return dfsToObjectErr(ctx, sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
-	rd, err := n.clnt.Open(n.hdfsPathJoin(bucket, key))
+	rd, err := n.fc.Open(ctx, &spb.FileOpenRequest{Path: n.sdfsPathJoin(bucket, key)})
 	if err != nil {
 		return hdfsToObjectErr(ctx, err, bucket, key)
+	} else if rd.GetErrorCode() > 0 {
+		return sdfsToObjectErr(ctx, sdfsError{err: rd.GetError(), errorCode: rd.GetErrorCode()}, bucket)
 	}
-	defer rd.Close()
-	_, err = io.Copy(writer, io.NewSectionReader(rd, startOffset, length))
-	if err == io.ErrClosedPipe {
-		// hdfs library doesn't send EOF correctly, so io.Copy attempts
-		// to write which returns io.ErrClosedPipe - just ignore
-		// this for now.
-		err = nil
-	}
-	return hdfsToObjectErr(ctx, err, bucket, key)
-}
-
-func (n *hdfsObjects) isObjectDir(ctx context.Context, bucket, object string) bool {
-	f, err := n.clnt.Open(n.hdfsPathJoin(bucket, object))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false
-		}
-		logger.LogIf(ctx, err)
-		return false
-	}
-	defer f.Close()
-	fis, err := f.Readdir(1)
-	if err != nil && err != io.EOF {
-		logger.LogIf(ctx, err)
-		return false
-	}
-	// Readdir returns an io.EOF when len(fis) == 0.
-	return len(fis) == 0
+	defer n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: rd.GetFileHandle()})
+	rdr, err := n.fc.Read(ctx, &spb.DataReadRequest{FileHandle: rd.GetFileHandle(), Len: length, Start: startOffset})
+	_, err = writer.Write(rdr.GetData())
+	return sdfsToObjectErr(ctx, err, bucket, key)
 }
 
 // GetObjectInfo reads object info and replies back ObjectInfo.
-func (n *hdfsObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
-	_, err = n.clnt.Stat(n.hdfsPathJoin(bucket))
+func (n *sdfsObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
+	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.PathJoin(bucket)})
 	if err != nil {
-		return objInfo, hdfsToObjectErr(ctx, err, bucket)
+		return objInfo, sdfsToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return objInfo, sdfsToObjectErr(ctx, sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
-	if strings.HasSuffix(object, hdfsSeparator) && !n.isObjectDir(ctx, bucket, object) {
-		return objInfo, hdfsToObjectErr(ctx, os.ErrNotExist, bucket, object)
+	if strings.HasSuffix(object, sdfsSeparator) && !fi.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR {
+		return objInfo, sdfsToObjectErr(ctx, sdfsError{
+			err:       "object does not exist",
+			errorCode: spb.ErrorCodes_ENOENT,
+		}, bucket)
 	}
 
-	fi, err := n.clnt.Stat(n.hdfsPathJoin(bucket, object))
+	fi, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.sdfsPathJoin(bucket, object)})
 	if err != nil {
-		return objInfo, hdfsToObjectErr(ctx, err, bucket, object)
+		return objInfo, sdfsToObjectErr(ctx, err, bucket, object)
+	} else if fi.GetErrorCode() > 0 {
+		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket)
 	}
 	return minio.ObjectInfo{
 		Bucket:  bucket,
 		Name:    object,
-		ModTime: fi.ModTime(),
+		ModTime: time.Unix(0, fi.GetResponse()[0].GetMtime()*int64(1000000)),
 		Size:    fi.Size(),
-		IsDir:   fi.IsDir(),
-		AccTime: fi.(*hdfs.FileInfo).AccessTime(),
+		IsDir:   fi.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR,
+		AccTime: time.Unix(0, fi.GetResponse()[0].GetAtime()*int64(1000000)),
 	}, nil
 }
 
-func (n *hdfsObjects) PutObject(ctx context.Context, bucket string, object string, r *minio.PutObjReader, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
-	_, err = n.clnt.Stat(n.hdfsPathJoin(bucket))
+func (n *sdfsObjects) PutObject(ctx context.Context, bucket string, object string, r *minio.PutObjReader, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
+	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.PathJoin(bucket)})
 	if err != nil {
-		return objInfo, hdfsToObjectErr(ctx, err, bucket)
+		return objInfo, sdfsToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
 
-	name := n.hdfsPathJoin(bucket, object)
+	name := n.sdfsPathJoin(bucket, object)
 
 	// If its a directory create a prefix {
-	if strings.HasSuffix(object, hdfsSeparator) && r.Size() == 0 {
-		if err = n.clnt.MkdirAll(name, os.FileMode(0755)); err != nil {
-			n.deleteObject(n.hdfsPathJoin(bucket), name)
-			return objInfo, hdfsToObjectErr(ctx, err, bucket, object)
+	if strings.HasSuffix(object, sdfsSeparator) && r.Size() == 0 {
+		mkd, err := n.fc.MkDirAll(ctx, &spb.MkDirRequest{Path: name})
+		if err != nil {
+			return objInfo, sdfsToObjectErr(ctx, err, bucket)
+		} else if fb.GetErrorCode() > 0 {
+			return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 		}
 	} else {
-		tmpname := n.hdfsPathJoin(minioMetaTmpBucket, minio.MustGetUUID())
-		var w *hdfs.FileWriter
-		w, err = n.clnt.Create(tmpname)
+		tmpname := n.sdfsPathJoin(minioMetaTmpBucket, minio.MustGetUUID())
+		var fh int64
+		mkf, err := n.fc.Mknod(ctx, &spb.MkNodRequest{Path: tmpname})
 		if err != nil {
-			return objInfo, hdfsToObjectErr(ctx, err, bucket, object)
+			return objInfo, sdfsToObjectErr(ctx, err, bucket)
+		} else if mkf.GetErrorCode() > 0 {
+			return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: mkf.GetError(), errorCode: mkf.GetErrorCode()}, bucket)
 		}
-		defer n.deleteObject(n.hdfsPathJoin(minioMetaTmpBucket), tmpname)
-		if _, err = io.Copy(w, r); err != nil {
-			w.Close()
-			return objInfo, hdfsToObjectErr(ctx, err, bucket, object)
+		fhr, err := n.fc.Open(ctx, &spb.FileOpenRequest{Path: tmpname})
+		if err != nil {
+			return objInfo, sdfsToObjectErr(ctx, err, bucket)
+		} else if fhr.GetErrorCode() > 0 {
+			return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fhr.GetError(), errorCode: fhr.GetErrorCode()}, bucket)
 		}
-		dir := path.Dir(name)
-		if dir != "" {
-			if err = n.clnt.MkdirAll(dir, os.FileMode(0755)); err != nil {
-				w.Close()
-				n.deleteObject(n.hdfsPathJoin(bucket), dir)
-				return objInfo, hdfsToObjectErr(ctx, err, bucket, object)
+		defer n.fc.Unlink(ctx, &spb.UnlinkRequest{Path: tmpname})
+		fh = fhr.GetFileHandle()
+		b1 := make([]byte, 128*1024)
+		var offset int64 = 0
+		var n1 int = 0
+		n1, err = r.Read(b1)
+		fwr, err := n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: b1, Start: offset, Len: int32(n1)})
+		offset += n1
+		if err != nil {
+			n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+			return objInfo, sdfsToObjectErr(ctx, err, bucket)
+		} else if fwr.GetErrorCode() > 0 {
+			n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+			return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fwr.GetError(), errorCode: fwr.GetErrorCode()}, bucket)
+		}
+		for n1 == len(b1) {
+			n1, err = r.Read(b1)
+			fwr, err = n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: b1, Start: offset, Len: int32(n1)})
+			offset += n1
+			if err != nil {
+				n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+				return objInfo, sdfsToObjectErr(ctx, err, bucket)
+			} else if fwr.GetErrorCode() > 0 {
+				n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+				return objInfo, sdfsToObjectErr(ctx, sdfsError{err: fwr.GetError(), errorCode: fwr.GetErrorCode()}, bucket)
 			}
 		}
-		w.Close()
-		if err = n.clnt.Rename(tmpname, name); err != nil {
-			return objInfo, hdfsToObjectErr(ctx, err, bucket, object)
+		n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+		dir := path.Dir(name)
+		if dir != "" {
+			mkd, err = n.fc.MkDirAll(ctx, &spb.MkDirRequest{Path: dir})
+			if err != nil {
+				return objInfo, sdfsToObjectErr(ctx, err, bucket)
+			} else if mkd.GetErrorCode() > 0 {
+				return objInfo, sdfsToObjectErr(ctx, sdfsError{err: mkd.GetError(), errorCode: mkd.GetErrorCode()}, bucket)
+			}
 		}
+
+		_, err = n.fc.Rename(ctx, &spb.FileRenameRequest{Src: tmpname, Dest: name})
+
 	}
-	fi, err := n.clnt.Stat(name)
+
+	fi, err := n.fc.Stat(ctx, &spb.FileInfoRequest{FileName: name})
 	if err != nil {
-		return objInfo, hdfsToObjectErr(ctx, err, bucket, object)
+		return objInfo, sdfsToObjectErr(ctx, err, bucket, object)
+	} else if fi.GetErrorCode() > 0 {
+		return objInfo, sdfsToObjectErr(ctx, sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket)
 	}
+
 	return minio.ObjectInfo{
 		Bucket:  bucket,
 		Name:    object,
 		ETag:    r.MD5CurrentHexString(),
-		ModTime: fi.ModTime(),
+		ModTime: time.Unix(0, fi.GetResponse()[0].GetMtime()*int64(1000000)),
 		Size:    fi.Size(),
-		IsDir:   fi.IsDir(),
-		AccTime: fi.(*hdfs.FileInfo).AccessTime(),
+		IsDir:   fi.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR,
+		AccTime: time.Unix(0, fi.GetResponse()[0].GetAtime()*int64(1000000)),
 	}, nil
 }
 
-func (n *hdfsObjects) NewMultipartUpload(ctx context.Context, bucket string, object string, opts minio.ObjectOptions) (uploadID string, err error) {
-	_, err = n.clnt.Stat(n.hdfsPathJoin(bucket))
+func (n *sdfsObjects) NewMultipartUpload(ctx context.Context, bucket string, object string, opts minio.ObjectOptions) (uploadID string, err error) {
+	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.PathJoin(bucket)})
 	if err != nil {
-		return uploadID, hdfsToObjectErr(ctx, err, bucket)
+		return uploadID, genericToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return uploadID, genericToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
 
 	uploadID = minio.MustGetUUID()
-	if err = n.clnt.CreateEmptyFile(n.hdfsPathJoin(minioMetaTmpBucket, uploadID)); err != nil {
-		return uploadID, hdfsToObjectErr(ctx, err, bucket)
+	fcr, err := n.fc.Mknod(ctx, &spb.MkNodRequest{n.sdfsPathJoin(minioMetaTmpBucket, uploadID)})
+	if err != nil {
+		return uploadID, genericToObjectErr(ctx, err, bucket)
+	} else if fcr.GetErrorCode() > 0 {
+		return uploadID, genericToObjectErr(ctx, &sdfsError{err: fcr.GetError(), errorCode: fcr.GetErrorCode()}, bucket)
 	}
-
 	return uploadID, nil
 }
 
-func (n *hdfsObjects) ListMultipartUploads(ctx context.Context, bucket string, prefix string, keyMarker string, uploadIDMarker string, delimiter string, maxUploads int) (lmi minio.ListMultipartsInfo, err error) {
-	_, err = n.clnt.Stat(n.hdfsPathJoin(bucket))
+func (n *sdfsObjects) ListMultipartUploads(ctx context.Context, bucket string, prefix string, keyMarker string, uploadIDMarker string, delimiter string, maxUploads int) (lmi minio.ListMultipartsInfo, err error) {
+	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.PathJoin(bucket)})
 	if err != nil {
-		return lmi, hdfsToObjectErr(ctx, err, bucket)
+		return lmi, genericToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return lmi, genericToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
 
 	// It's decided not to support List Multipart Uploads, hence returning empty result.
 	return lmi, nil
 }
 
-func (n *hdfsObjects) checkUploadIDExists(ctx context.Context, bucket, object, uploadID string) (err error) {
-	_, err = n.clnt.Stat(n.hdfsPathJoin(minioMetaTmpBucket, uploadID))
+func (n *sdfsObjects) checkUploadIDExists(ctx context.Context, bucket, object, uploadID string) (err error) {
+	fb, err := n.fc.Stat(n.sdfsPathJoin(minioMetaTmpBucket, uploadID))
 	if err != nil {
-		return hdfsToObjectErr(ctx, err, bucket, object, uploadID)
+		return sdfsToObjectErr(ctx, err, bucket, object, uploadID)
+	} else if fb.GetErrorCode() > 0 {
+		return genericToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
 	return nil
 }
 
 // GetMultipartInfo returns multipart info of the uploadId of the object
-func (n *hdfsObjects) GetMultipartInfo(ctx context.Context, bucket, object, uploadID string, opts minio.ObjectOptions) (result minio.MultipartInfo, err error) {
-	_, err = n.clnt.Stat(n.hdfsPathJoin(bucket))
+func (n *sdfsObjects) GetMultipartInfo(ctx context.Context, bucket, object, uploadID string, opts minio.ObjectOptions) (result minio.MultipartInfo, err error) {
+	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.PathJoin(bucket)})
 	if err != nil {
-		return result, hdfsToObjectErr(ctx, err, bucket)
+		return result, genericToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return result, genericToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
-
-	if err = n.checkUploadIDExists(ctx, bucket, object, uploadID); err != nil {
-		return result, err
-	}
-
 	result.Bucket = bucket
 	result.Object = object
 	result.UploadID = uploadID
 	return result, nil
 }
 
-func (n *hdfsObjects) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int, opts minio.ObjectOptions) (result minio.ListPartsInfo, err error) {
-	_, err = n.clnt.Stat(n.hdfsPathJoin(bucket))
+func (n *sdfsObjects) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int, opts minio.ObjectOptions) (result minio.ListPartsInfo, err error) {
+	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.PathJoin(bucket)})
 	if err != nil {
-		return result, hdfsToObjectErr(ctx, err, bucket)
+		return result, genericToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return result, genericToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
 
 	if err = n.checkUploadIDExists(ctx, bucket, object, uploadID); err != nil {
@@ -686,28 +749,59 @@ func (n *hdfsObjects) ListObjectParts(ctx context.Context, bucket, object, uploa
 	return result, nil
 }
 
-func (n *hdfsObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject, uploadID string, partID int,
+func (n *sdfsObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject, uploadID string, partID int,
 	startOffset int64, length int64, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.PartInfo, error) {
+	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.PathJoin(bucket)})
+	if err != nil {
+		return nil, genericToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return nil, genericToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
+	}
 	return n.PutObjectPart(ctx, dstBucket, dstObject, uploadID, partID, srcInfo.PutObjReader, dstOpts)
 }
 
-func (n *hdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, r *minio.PutObjReader, opts minio.ObjectOptions) (info minio.PartInfo, err error) {
-	_, err = n.clnt.Stat(n.hdfsPathJoin(bucket))
+func (n *sdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, r *minio.PutObjReader, opts minio.ObjectOptions) (info minio.PartInfo, err error) {
+	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.PathJoin(bucket)})
 	if err != nil {
-		return info, hdfsToObjectErr(ctx, err, bucket)
+		return info, genericToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return result, genericToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
-
-	var w *hdfs.FileWriter
-	w, err = n.clnt.Append(n.hdfsPathJoin(minioMetaTmpBucket, uploadID))
+	fi, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.sdfsPathJoin(minioMetaTmpBucket, uploadID)})
 	if err != nil {
-		return info, hdfsToObjectErr(ctx, err, bucket, object, uploadID)
+		return info, genericToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return result, genericToObjectErr(ctx, &sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket)
 	}
-	defer w.Close()
-	_, err = io.Copy(w, r.Reader)
+	fhr, err := n.fc.Open(ctx, &spb.FileOpenRequest{Path: n.sdfsPathJoin(minioMetaTmpBucket, uploadID)})
+	offset := fi.GetResponse()[0].GetSize()
+	fh = fhr.GetFileHandle()
+	b1 := make([]byte, 128*1024)
+	var offset int64 = 0
+	var n1 int = 0
+	n1, err = r.Read(b1)
+	fwr, err := n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: b1, Start: offset, Len: int32(n1)})
+	offset += n1
 	if err != nil {
-		return info, hdfsToObjectErr(ctx, err, bucket, object, uploadID)
+		n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+		return objInfo, sdfsToObjectErr(ctx, err, bucket)
+	} else if fwr.GetErrorCode() > 0 {
+		n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fwr.GetError(), errorCode: fwr.GetErrorCode()}, bucket)
 	}
-
+	for n1 == len(b1) {
+		n1, err = r.Read(b1)
+		fwr, err = n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: b1, Start: offset, Len: int32(n1)})
+		offset += n1
+		if err != nil {
+			n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+			return objInfo, sdfsToObjectErr(ctx, err, bucket)
+		} else if fwr.GetErrorCode() > 0 {
+			n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+			return objInfo, sdfsToObjectErr(ctx, sdfsError{err: fwr.GetError(), errorCode: fwr.GetErrorCode()}, bucket)
+		}
+	}
+	n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
 	info.PartNumber = partID
 	info.ETag = r.MD5CurrentHexString()
 	info.LastModified = minio.UTCNow()
@@ -716,34 +810,47 @@ func (n *hdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadI
 	return info, nil
 }
 
-func (n *hdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, parts []minio.CompletePart, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
-	_, err = n.clnt.Stat(n.hdfsPathJoin(bucket))
+func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, parts []minio.CompletePart, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
+	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{Path: n.PathJoin(bucket)})
 	if err != nil {
-		return objInfo, hdfsToObjectErr(ctx, err, bucket)
+		return info, genericToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return result, genericToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
 
 	if err = n.checkUploadIDExists(ctx, bucket, object, uploadID); err != nil {
 		return objInfo, err
 	}
 
-	name := n.hdfsPathJoin(bucket, object)
+	name := n.sdfsPathJoin(bucket, object)
 	dir := path.Dir(name)
 	if dir != "" {
-		if err = n.clnt.MkdirAll(dir, os.FileMode(0755)); err != nil {
-			return objInfo, hdfsToObjectErr(ctx, err, bucket, object)
+		fd, err := n.fc.MkDirAll(ctx,&spb.MkDirRequest{Path:dir})
+		if err = {
+			return objInfo, genericToObjectErr(ctx, err, bucket, object)
+		}
+		if fd.GetErrorCode() > 0 {
+			return objInfo, genericToObjectErr(ctx, &sdfsError{err: fd.GetError(), errorCode: fd.GetErrorCode()}, bucket)
 		}
 	}
-
-	err = n.clnt.Rename(n.hdfsPathJoin(minioMetaTmpBucket, uploadID), name)
-	// Object already exists is an error on HDFS
-	// remove it and then create it again.
-	if os.IsExist(err) {
-		if err = n.clnt.Remove(name); err != nil {
+	fr, err := n.fc.Rename(ctx,&spb.FileRenameRequest{Src:n.sdfsPathJoin(minioMetaTmpBucket, uploadID),Dest:name})
+	if err != nil {
+		return objInfo, sdfsToObjectErr(ctx, err, bucket, object)
+	}
+	if fr.GetErrorCode() == spb.ErrorCodes_EEXIST {
+		frr,err := n.fc.RmDir(name)
+		if err != nil {
 			if dir != "" {
-				n.deleteObject(n.hdfsPathJoin(bucket), dir)
+				n.deleteObject(ctx,n.sdfsPathJoin(bucket), dir)
 			}
-			return objInfo, hdfsToObjectErr(ctx, err, bucket, object)
+			return objInfo, sdfsToObjectErr(ctx, err, bucket, object)
 		}
+		
+		frn,err := n.fc.Rename(ctx,&spb.FileRenameRequest{Src: n.sdfsPathJoin(minioMetaTmpBucket, uploadID),Dest: name})
+		if err != nil {
+			return objInfo, sdfsToObjectErr(ctx, err, bucket, object)
+		}
+
 		if err = n.clnt.Rename(n.hdfsPathJoin(minioMetaTmpBucket, uploadID), name); err != nil {
 			if dir != "" {
 				n.deleteObject(n.hdfsPathJoin(bucket), dir)
@@ -769,6 +876,7 @@ func (n *hdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 		AccTime: fi.(*hdfs.FileInfo).AccessTime(),
 	}, nil
 }
+
 
 func (n *hdfsObjects) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) (err error) {
 	_, err = n.clnt.Stat(n.hdfsPathJoin(bucket))

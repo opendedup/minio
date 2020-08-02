@@ -229,12 +229,7 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	// avoid URL path encoding minio/minio#8950
 	router := mux.NewRouter().SkipClean(true).UseEncodedPath()
 
-	if globalEtcdClient != nil {
-		// Enable STS router if etcd is enabled.
-		registerSTSRouter(router)
-	}
-
-	enableIAMOps := globalEtcdClient != nil
+	enableIAMOps := false
 
 	// Enable IAM admin APIs if etcd is enabled, if not just enable basic
 	// operations such as profiling, server info etc.
@@ -308,14 +303,6 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 		logger.FatalIf(globalNotificationSys.Init(buckets, newObject), "Unable to initialize notification system")
 	}
 
-	if globalEtcdClient != nil {
-		// ****  WARNING ****
-		// Migrating to encrypted backend on etcd should happen before initialization of
-		// IAM sub-systems, make sure that we do not move the above codeblock elsewhere.
-		logger.FatalIf(migrateIAMConfigsEtcdToEncrypted(GlobalContext, globalEtcdClient),
-			"Unable to handle encrypted backend for iam and policies")
-	}
-
 	if enableIAMOps {
 		// Initialize IAM sys.
 		startBackgroundIAMLoad(GlobalContext)
@@ -330,15 +317,6 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 		globalObjLayerMutex.Lock()
 		globalCacheObjectAPI = cacheAPI
 		globalObjLayerMutex.Unlock()
-	}
-
-	// Populate existing buckets to the etcd backend
-	if globalDNSConfig != nil {
-		buckets, err := newObject.ListBuckets(GlobalContext)
-		if err != nil {
-			logger.Fatal(err, "Unable to list buckets")
-		}
-		initFederatorBackend(buckets, newObject)
 	}
 
 	// Verify if object layer supports

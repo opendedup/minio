@@ -324,12 +324,6 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 		return fmt.Errorf("Unable to initialize config system: %w", err)
 	}
 
-	// Populate existing buckets to the etcd backend
-	if globalDNSConfig != nil {
-		// Background this operation.
-		go initFederatorBackend(buckets, newObject)
-	}
-
 	// Initialize bucket metadata sub-system.
 	if err := globalBucketMetadataSys.Init(ctx, buckets, newObject); err != nil {
 		return fmt.Errorf("Unable to initialize bucket metadata sub-system: %w", err)

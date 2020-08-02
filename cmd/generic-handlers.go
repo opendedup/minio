@@ -21,10 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/minio-go/v7/pkg/set"
-
 	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/minio/cmd/config/etcd/dns"
 	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/http/stats"
@@ -591,105 +588,9 @@ type bucketForwardingHandler struct {
 }
 
 func (f bucketForwardingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if globalDNSConfig == nil || len(globalDomainNames) == 0 ||
-		guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||
-		guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) ||
-		!globalBucketFederation {
-		f.handler.ServeHTTP(w, r)
-		return
-	}
 
-	// For browser requests, when federation is setup we need to
-	// specifically handle download and upload for browser requests.
-	if guessIsBrowserReq(r) && globalDNSConfig != nil && len(globalDomainNames) > 0 {
-		var bucket, _ string
-		switch r.Method {
-		case http.MethodPut:
-			if getRequestAuthType(r) == authTypeJWT {
-				bucket, _ = path2BucketObjectWithBasePath(minioReservedBucketPath+"/upload", r.URL.Path)
-			}
-		case http.MethodGet:
-			if t := r.URL.Query().Get("token"); t != "" {
-				bucket, _ = path2BucketObjectWithBasePath(minioReservedBucketPath+"/download", r.URL.Path)
-			} else if getRequestAuthType(r) != authTypeJWT && !strings.HasPrefix(r.URL.Path, minioReservedBucketPath) {
-				bucket, _ = request2BucketObjectName(r)
-			}
-		}
-		if bucket == "" {
-			f.handler.ServeHTTP(w, r)
-			return
-		}
-		sr, err := globalDNSConfig.Get(bucket)
-		if err != nil {
-			if err == dns.ErrNoEntriesFound {
-				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrNoSuchBucket),
-					r.URL, guessIsBrowserReq(r))
-			} else {
-				writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err),
-					r.URL, guessIsBrowserReq(r))
-			}
-			return
-		}
-		if globalDomainIPs.Intersection(set.CreateStringSet(getHostsSlice(sr)...)).IsEmpty() {
-			r.URL.Scheme = "http"
-			if globalIsSSL {
-				r.URL.Scheme = "https"
-			}
-			r.URL.Host = getHostFromSrv(sr)
-			f.fwd.ServeHTTP(w, r)
-			return
-		}
-		f.handler.ServeHTTP(w, r)
-		return
-	}
-
-	bucket, object := request2BucketObjectName(r)
-
-	// Requests in federated setups for STS type calls which are
-	// performed at '/' resource should be routed by the muxer,
-	// the assumption is simply such that requests without a bucket
-	// in a federated setup cannot be proxied, so serve them at
-	// current server.
-	if bucket == "" {
-		f.handler.ServeHTTP(w, r)
-		return
-	}
-
-	// MakeBucket requests should be handled at current endpoint
-	if r.Method == http.MethodPut && bucket != "" && object == "" {
-		f.handler.ServeHTTP(w, r)
-		return
-	}
-
-	// CopyObject requests should be handled at current endpoint as path style
-	// requests have target bucket and object in URI and source details are in
-	// header fields
-	if r.Method == http.MethodPut && r.Header.Get(xhttp.AmzCopySource) != "" {
-		bucket, object = path2BucketObject(r.Header.Get(xhttp.AmzCopySource))
-		if bucket == "" || object == "" {
-			f.handler.ServeHTTP(w, r)
-			return
-		}
-	}
-	sr, err := globalDNSConfig.Get(bucket)
-	if err != nil {
-		if err == dns.ErrNoEntriesFound {
-			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrNoSuchBucket), r.URL, guessIsBrowserReq(r))
-		} else {
-			writeErrorResponse(r.Context(), w, toAPIError(r.Context(), err), r.URL, guessIsBrowserReq(r))
-		}
-		return
-	}
-	if globalDomainIPs.Intersection(set.CreateStringSet(getHostsSlice(sr)...)).IsEmpty() {
-		r.URL.Scheme = "http"
-		if globalIsSSL {
-			r.URL.Scheme = "https"
-		}
-		r.URL.Host = getHostFromSrv(sr)
-		f.fwd.ServeHTTP(w, r)
-		return
-	}
 	f.handler.ServeHTTP(w, r)
+
 }
 
 // setBucketForwardingHandler middleware forwards the path style requests

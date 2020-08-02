@@ -29,7 +29,6 @@ import (
 
 	minio "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/tags"
-	"github.com/minio/minio/cmd/config/etcd/dns"
 	"github.com/minio/minio/cmd/crypto"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/auth"
@@ -1784,12 +1783,6 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 	if apiErr != ErrNone {
 		// If there was a match in the above switch case.
 		return apiErr
-	}
-
-	// etcd specific errors, a key is always a bucket for us return
-	// ErrNoSuchBucket in such a case.
-	if err == dns.ErrNoEntriesFound {
-		return ErrNoSuchBucket
 	}
 
 	switch err.(type) {

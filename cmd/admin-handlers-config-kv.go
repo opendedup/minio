@@ -28,7 +28,6 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/cmd/config/cache"
-	"github.com/minio/minio/cmd/config/etcd"
 	xldap "github.com/minio/minio/cmd/config/identity/ldap"
 	"github.com/minio/minio/cmd/config/identity/openid"
 	"github.com/minio/minio/cmd/config/policy/opa"
@@ -437,8 +436,6 @@ func (a adminAPIHandlers) GetConfigHandler(w http.ResponseWriter, r *http.Reques
 		for target, kv := range v {
 			off := kv.Get(config.Enable) == config.EnableOff
 			switch hkv.Key {
-			case config.EtcdSubSys:
-				off = !etcd.Enabled(kv)
 			case config.CacheSubSys:
 				off = !cache.Enabled(kv)
 			case config.StorageClassSubSys:

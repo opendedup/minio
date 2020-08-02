@@ -30,6 +30,9 @@ const (
 	// Minio Tmp meta prefix.
 	minioMetaTmpBucket = minioMetaBucket + "/tmp"
 
+	//bucket info dir
+	minioMetaInfoBucket = minioMetaBucket + "/buckets"
+
 	// Minio reserved bucket name.
 	minioReservedBucket = "minio"
 )

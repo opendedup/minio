@@ -78,7 +78,7 @@ require (
 	github.com/ncw/directio v1.0.5
 	github.com/nsqio/go-nsq v1.0.7
 	github.com/olekukonko/tablewriter v0.0.0-20170122224234-a0225b3f23b5 // indirect
-	github.com/opendedup/sdfs-client-go v0.1.1
+	github.com/opendedup/sdfs-client-go v0.1.3
 	github.com/ozonru/etcd v3.3.20+incompatible
 	github.com/philhofer/fwd v1.0.0 // indirect
 	github.com/pierrec/lz4 v2.4.0+incompatible

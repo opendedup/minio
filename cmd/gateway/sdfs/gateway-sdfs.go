@@ -844,14 +844,44 @@ func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 	if err = n.checkUploadIDExists(ctx, bucket, object, uploadID); err != nil {
 		return objInfo, err
 	}
-	tf := n.sdfsPathJoin(minioMetaTmpBucket, uploadID, "tempfile")
-	mkt, err := n.fc.Mknod(ctx, &spb.MkNodRequest{Path: tf})
+
 	var offset int64 = 0
 	fis := fb.GetResponse()
+	sort.SliceStable(fis, func(i, j int) bool {
+		ii, err := strconv.Atoi(fis[i].FileName)
+		if err != nil {
+			log.Printf("error reading %s", fis[i].FileName)
+		}
+		ji, err := strconv.Atoi(fis[j].FileName)
+		if err != nil {
+			log.Printf("error reading %s", fis[j].FileName)
+		}
+		return ii < ji
+	})
+	tf := n.sdfsPathJoin(minioMetaTmpBucket, uploadID, "tempfile")
+	mkt, err := n.fc.Mknod(ctx, &spb.MkNodRequest{Path: tf})
+	if err != nil {
+		return objInfo, genericToObjectErr(ctx, err, bucket)
+	} else if mkt.GetErrorCode() > 0 {
+		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: mkt.GetError(), errorCode: mkt.GetErrorCode()}, bucket)
+	}
 	for _, fl := range fis {
 		_tf := n.sdfsPathJoin(minioMetaTmpBucket, uploadID, fl.FileName)
-		sz = fl.GetSize()
-
+		sz := fl.GetSize()
+		cpx, err := n.fc.CopyExtent(ctx, &spb.CopyExtentRequest{
+			SrcFile:  _tf,
+			SrcStart: 0,
+			Length:   sz,
+			DstFile:  tf,
+			DstStart: offset,
+		})
+		if err != nil {
+			return objInfo, genericToObjectErr(ctx, err, bucket)
+		} else if cpx.GetErrorCode() > 0 {
+			return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: cpx.GetError(), errorCode: cpx.GetErrorCode()}, bucket)
+		}
+		n.fc.Unlink(ctx, &spb.UnlinkRequest{Path: _tf})
+		offset += sz
 	}
 
 	name := n.sdfsPathJoin(bucket, object)
@@ -865,7 +895,7 @@ func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 			return objInfo, genericToObjectErr(ctx, &sdfsError{err: fd.GetError(), errorCode: fd.GetErrorCode()}, bucket)
 		}
 	}
-	fr, err := n.fc.Rename(ctx, &spb.FileRenameRequest{Src: n.sdfsPathJoin(minioMetaTmpBucket, uploadID), Dest: name})
+	fr, err := n.fc.Rename(ctx, &spb.FileRenameRequest{Src: tf, Dest: name})
 	if err != nil {
 		return objInfo, genericToObjectErr(ctx, err, bucket, object)
 	}
@@ -877,11 +907,11 @@ func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 			}
 			return objInfo, genericToObjectErr(ctx, err, bucket, object)
 		}
-		_, err = n.fc.Rename(ctx, &spb.FileRenameRequest{Src: n.sdfsPathJoin(minioMetaTmpBucket, uploadID), Dest: name})
+		_, err = n.fc.Rename(ctx, &spb.FileRenameRequest{Src: tf, Dest: name})
 		if err != nil {
 			return objInfo, genericToObjectErr(ctx, err, bucket, object)
 		}
-		fr, err = n.fc.Rename(ctx, &spb.FileRenameRequest{Src: n.sdfsPathJoin(minioMetaTmpBucket, uploadID), Dest: name})
+		fr, err = n.fc.Rename(ctx, &spb.FileRenameRequest{Src: tf, Dest: name})
 		if err != nil {
 			return objInfo, genericToObjectErr(ctx, err, bucket, object)
 		} else if fr.GetErrorCode() > 0 {
@@ -891,6 +921,7 @@ func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 			return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fr.GetError(), errorCode: fr.GetErrorCode()}, bucket, object)
 		}
 	}
+	n.fc.RmDir(ctx, &spb.RmDirRequest{Path: n.sdfsPathJoin(minioMetaTmpBucket, uploadID)})
 	fi, err := n.fc.Stat(ctx, &spb.FileInfoRequest{FileName: name})
 	if err != nil {
 		return objInfo, genericToObjectErr(ctx, err, bucket, object)

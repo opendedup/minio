@@ -645,16 +645,18 @@ func (n *sdfsObjects) PutObject(ctx context.Context, bucket string, object strin
 		}
 		for n1 > 0 {
 			n1, err = r.Read(b1)
-			s = make([]byte, n1)
-			copy(s, b1)
-			fwr, err = n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: s, Start: offset, Len: int32(n1)})
-			offset += int64(n1)
-			if err != nil {
-				n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
-				return objInfo, genericToObjectErr(ctx, err, bucket, tmpname)
-			} else if fwr.GetErrorCode() > 0 {
-				n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
-				return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fwr.GetError(), errorCode: fwr.GetErrorCode()}, bucket, tmpname)
+			if n1 > 0 {
+				s = make([]byte, n1)
+				copy(s, b1)
+				fwr, err = n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: s, Start: offset, Len: int32(n1)})
+				offset += int64(n1)
+				if err != nil {
+					n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+					return objInfo, genericToObjectErr(ctx, err, bucket, tmpname)
+				} else if fwr.GetErrorCode() > 0 {
+					n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+					return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fwr.GetError(), errorCode: fwr.GetErrorCode()}, bucket, tmpname)
+				}
 			}
 		}
 		n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
@@ -784,17 +786,19 @@ func (n *sdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadI
 	} else if fb.GetErrorCode() > 0 {
 		return info, sdfsToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
+	log.Printf("1")
 	fi, err := n.fc.Stat(ctx, &spb.FileInfoRequest{FileName: n.sdfsPathJoin(minioMetaTmpBucket, uploadID)})
 	if err != nil {
 		return info, genericToObjectErr(ctx, err, bucket)
 	} else if fb.GetErrorCode() > 0 {
 		return info, sdfsToObjectErr(ctx, &sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket)
 	}
+	log.Printf("2")
 	filePath := n.sdfsPathJoin(minioMetaTmpBucket, uploadID, strconv.Itoa(partID))
 	fmr, err := n.fc.Mknod(ctx, &spb.MkNodRequest{Path: filePath})
 	if err != nil {
 		return info, genericToObjectErr(ctx, err, bucket)
-	} else if fmr.GetErrorCode() > 0 {
+	} else if fmr.GetErrorCode() > 0 && fmr.ErrorCode != spb.ErrorCodes_EEXIST {
 		return info, sdfsToObjectErr(ctx, &sdfsError{err: fmr.GetError(), errorCode: fmr.GetErrorCode()}, bucket)
 	}
 	fhr, err := n.fc.Open(ctx, &spb.FileOpenRequest{Path: filePath})
@@ -803,8 +807,11 @@ func (n *sdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadI
 	b1 := make([]byte, 128*1024)
 	var n1 int = 0
 	n1, err = r.Read(b1)
-	fwr, err := n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: b1, Start: offset, Len: int32(n1)})
+	s := make([]byte, n1)
+	copy(s, b1)
+	fwr, err := n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: s, Start: offset, Len: int32(n1)})
 	offset += int64(n1)
+	log.Printf("3")
 	if err != nil {
 		n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
 		return info, genericToObjectErr(ctx, err, bucket)
@@ -812,24 +819,30 @@ func (n *sdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadI
 		n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
 		return info, sdfsToObjectErr(ctx, &sdfsError{err: fwr.GetError(), errorCode: fwr.GetErrorCode()}, bucket)
 	}
-	for n1 == len(b1) {
+	log.Printf("4")
+	for n1 > 0 {
 		n1, err = r.Read(b1)
-		fwr, err = n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: b1, Start: offset, Len: int32(n1)})
-		offset += int64(n1)
-		if err != nil {
-			n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
-			return info, genericToObjectErr(ctx, err, bucket)
-		} else if fwr.GetErrorCode() > 0 {
-			n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
-			return info, sdfsToObjectErr(ctx, &sdfsError{err: fwr.GetError(), errorCode: fwr.GetErrorCode()}, bucket)
+		if n1 > 0 {
+			s := make([]byte, n1)
+			copy(s, b1)
+			fwr, err = n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: s, Start: offset, Len: int32(n1)})
+			offset += int64(n1)
+			if err != nil {
+				n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+				return info, genericToObjectErr(ctx, err, bucket)
+			} else if fwr.GetErrorCode() > 0 {
+				n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
+				return info, sdfsToObjectErr(ctx, &sdfsError{err: fwr.GetError(), errorCode: fwr.GetErrorCode()}, bucket)
+			}
 		}
 	}
+	log.Printf("5")
 	n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
 	info.PartNumber = partID
 	info.ETag = r.MD5CurrentHexString()
 	info.LastModified = minio.UTCNow()
 	info.Size = r.Reader.Size()
-
+	log.Printf("6")
 	return info, nil
 }
 

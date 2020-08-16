@@ -39,6 +39,7 @@ import (
 
 	spb "github.com/opendedup/sdfs-client-go/sdfs"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 const (
@@ -85,6 +86,45 @@ EXAMPLES:
 		CustomHelpTemplate: sdfsGatewayTemplate,
 		HideHelpCommand:    true,
 	})
+}
+
+func clientInterceptor(
+	ctx context.Context,
+	method string,
+	req interface{},
+	reply interface{},
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	// Logic before invoking the invoker
+	start := time.Now()
+	// Calls the invoker to execute RPC
+	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "bearer poop")
+	err := invoker(ctx, method, req, reply, cc, opts...)
+	// Logic after invoking the invoker
+	log.Printf("Invoked RPC method=%s; Duration=%s; Error=%v", method,
+		time.Since(start), err)
+	return err
+}
+
+func s3MetaToSdfsAttributes(meta map[string]string) []*spb.FileAttributes {
+	var attrs []*spb.FileAttributes
+	for k, v := range meta {
+		log.Printf("key = %s val = %s", k, v)
+		attrs = append(attrs, &spb.FileAttributes{Key: k, Value: v})
+	}
+	return attrs
+}
+
+func sdfsAttributesToS3Meta(meta []*spb.FileAttributes) map[string]string {
+
+	s3Metadata := make(map[string]string)
+	for i := range meta {
+		log.Printf("key = %s val = %s", meta[i].Key, meta[i].Value)
+		s3Metadata[meta[i].Key] = meta[i].Value
+	}
+	return s3Metadata
 }
 
 // Handler for 'minio gateway sdfs' command line.
@@ -144,7 +184,7 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 	if err != nil {
 		return nil, fmt.Errorf("unable to lookup local user: %s", err)
 	}
-	conn, err := grpc.Dial(address, grpc.WithInsecure(), grpc.WithBlock())
+	conn, err := grpc.Dial(address, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithUnaryInterceptor(clientInterceptor))
 	if err != nil {
 		log.Fatalf("did not connect: %v", err)
 		return nil, fmt.Errorf("unable to initialize sdfsClient")
@@ -244,8 +284,13 @@ func genericToObjectErr(ctx context.Context, err error, params ...string) error 
 	if err == nil {
 		return nil
 	}
+	bucket := ""
+	switch len(params) {
+	case 1:
+		bucket = params[0]
+	}
 	logger.LogIf(ctx, err)
-	return err
+	return minio.BucketNotFound{Bucket: bucket}
 }
 
 // sdfsIsValidBucketName verifies whether a bucket name is valid.
@@ -514,6 +559,7 @@ func (n *sdfsObjects) GetObjectNInfo(ctx context.Context, bucket, object string,
 	pr, pw := io.Pipe()
 	go func() {
 		n.GetObject(ctx, bucket, object, startOffset, length, pw, objInfo.ETag, opts)
+		pw.CloseWithError(err)
 	}()
 
 	// Setup cleanup function to cause the above go-routine to
@@ -524,23 +570,38 @@ func (n *sdfsObjects) GetObjectNInfo(ctx context.Context, bucket, object string,
 }
 
 func (n *sdfsObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.ObjectInfo, error) {
-	cpSrcDstSame := minio.IsStringEqual(n.sdfsPathJoin(srcBucket, srcObject), n.sdfsPathJoin(dstBucket, dstObject))
-	if cpSrcDstSame {
-		return n.GetObjectInfo(ctx, srcBucket, srcObject, minio.ObjectOptions{})
+	sdfsMeta := s3MetaToSdfsAttributes(srcInfo.UserDefined)
+	s3MetaToSdfsAttributes(srcInfo.UserDefined)
+	log.Printf("copy from %s to %s ", n.sdfsPathJoin(srcBucket, srcObject), n.sdfsPathJoin(dstBucket, dstObject))
+
+	if n.sdfsPathJoin(srcBucket, srcObject) == n.sdfsPathJoin(dstBucket, dstObject) {
+		fu, err := n.fc.SetUserMetaData(ctx, &spb.SetUserMetaDataRequest{Path: n.sdfsPathJoin(dstBucket, dstObject), FileAttributes: sdfsMeta})
+		if err != nil {
+			return minio.ObjectInfo{}, genericToObjectErr(ctx, err, dstBucket, dstObject)
+		} else if fu.GetErrorCode() > 0 {
+			return minio.ObjectInfo{}, sdfsToObjectErr(ctx, &sdfsError{err: fu.GetError(), errorCode: fu.GetErrorCode()}, dstBucket, dstObject)
+		}
+		return n.GetObjectInfo(ctx, dstBucket, dstObject, minio.ObjectOptions{})
 	}
 
 	fcc, err := n.fc.CreateCopy(ctx, &spb.FileSnapshotRequest{
 		Src:  n.sdfsPathJoin(srcBucket, srcObject),
 		Dest: n.sdfsPathJoin(dstBucket, dstObject),
 	})
+
 	if err != nil {
 		return minio.ObjectInfo{}, genericToObjectErr(ctx, err, srcBucket)
 	} else if fcc.GetErrorCode() > 0 {
 		return minio.ObjectInfo{}, sdfsToObjectErr(ctx, &sdfsError{err: fcc.GetError(), errorCode: fcc.GetErrorCode()}, srcBucket)
 	} else {
-		return n.GetObjectInfo(ctx, dstBucket, dstObject, minio.ObjectOptions{})
+		fu, err := n.fc.SetUserMetaData(ctx, &spb.SetUserMetaDataRequest{Path: n.sdfsPathJoin(dstBucket, dstObject), FileAttributes: sdfsMeta})
+		if err != nil {
+			return minio.ObjectInfo{}, genericToObjectErr(ctx, err, dstBucket, dstObject)
+		} else if fu.GetErrorCode() > 0 {
+			return minio.ObjectInfo{}, sdfsToObjectErr(ctx, &sdfsError{err: fu.GetError(), errorCode: fu.GetErrorCode()}, dstBucket, dstObject)
+		}
+		return n.GetObjectInfo(ctx, dstBucket, dstObject, dstOpts)
 	}
-
 }
 
 func (n *sdfsObjects) GetObject(ctx context.Context, bucket, key string, startOffset int64, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
@@ -557,9 +618,26 @@ func (n *sdfsObjects) GetObject(ctx context.Context, bucket, key string, startOf
 		return sdfsToObjectErr(ctx, &sdfsError{err: rd.GetError(), errorCode: rd.GetErrorCode()}, bucket)
 	}
 	defer n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: rd.GetFileHandle()})
-	rdr, err := n.fc.Read(ctx, &spb.DataReadRequest{FileHandle: rd.GetFileHandle(), Len: int32(length), Start: startOffset})
-	_, err = writer.Write(rdr.GetData())
-	return genericToObjectErr(ctx, err, bucket, key)
+	var read int64 = 0
+	var blocksize int32 = 128 * 1024
+	for read < length {
+		if blocksize > int32(length-read) {
+			blocksize = int32(length - read)
+		}
+		rdr, err := n.fc.Read(ctx, &spb.DataReadRequest{FileHandle: rd.GetFileHandle(), Len: int32(blocksize), Start: startOffset + read})
+		if err != nil {
+			return genericToObjectErr(ctx, err, bucket, key)
+		} else if rdr.GetErrorCode() > 0 {
+			return sdfsToObjectErr(ctx, &sdfsError{err: rdr.GetError(), errorCode: rdr.GetErrorCode()}, bucket, key)
+		}
+		_, err = writer.Write(rdr.GetData())
+		if err != nil {
+			return genericToObjectErr(ctx, err, bucket, key)
+		}
+		read += int64(blocksize)
+	}
+
+	return nil
 }
 
 // GetObjectInfo reads object info and replies back ObjectInfo.
@@ -582,14 +660,30 @@ func (n *sdfsObjects) GetObjectInfo(ctx context.Context, bucket, object string, 
 	} else if fi.GetErrorCode() > 0 {
 		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket)
 	}
-
+	metadata := sdfsAttributesToS3Meta(fi.GetResponse()[0].FileAttributes)
+	var etag string
+	var contentType string
+	var contentEncoding string
+	if val, ok := metadata["x-amz-meta-md5sum"]; ok {
+		etag = val
+	}
+	if val, ok := metadata["Content-Type"]; ok {
+		contentType = val
+	}
+	if val, ok := metadata["Content-Encoding"]; ok {
+		contentEncoding = val
+	}
 	return minio.ObjectInfo{
-		Bucket:  bucket,
-		Name:    object,
-		ModTime: time.Unix(0, fi.GetResponse()[0].GetMtime()*int64(1000000)),
-		Size:    fi.GetResponse()[0].GetSize(),
-		IsDir:   fi.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR,
-		AccTime: time.Unix(0, fi.GetResponse()[0].GetAtime()*int64(1000000)),
+		Bucket:          bucket,
+		Name:            object,
+		UserDefined:     metadata,
+		ModTime:         time.Unix(0, fi.GetResponse()[0].GetMtime()*int64(1000000)),
+		Size:            fi.GetResponse()[0].GetSize(),
+		IsDir:           fi.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR,
+		AccTime:         time.Unix(0, fi.GetResponse()[0].GetAtime()*int64(1000000)),
+		ContentType:     contentType,
+		ContentEncoding: contentEncoding,
+		ETag:            etag,
 	}, nil
 }
 
@@ -686,15 +780,24 @@ func (n *sdfsObjects) PutObject(ctx context.Context, bucket string, object strin
 	} else if fi.GetErrorCode() > 0 {
 		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket, name)
 	}
+	opts.UserDefined["x-amz-meta-md5sum"] = r.MD5CurrentHexString()
+	sdfsMeta := s3MetaToSdfsAttributes(opts.UserDefined)
+	fu, err := n.fc.SetUserMetaData(ctx, &spb.SetUserMetaDataRequest{Path: name, FileAttributes: sdfsMeta})
+	if err != nil {
+		return objInfo, genericToObjectErr(ctx, err, bucket, object)
+	} else if fu.GetErrorCode() > 0 {
+		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fu.GetError(), errorCode: fu.GetErrorCode()}, bucket, name)
+	}
 
 	return minio.ObjectInfo{
-		Bucket:  bucket,
-		Name:    object,
-		ETag:    r.MD5CurrentHexString(),
-		ModTime: time.Unix(0, fi.GetResponse()[0].GetMtime()*int64(1000000)),
-		Size:    fi.GetResponse()[0].GetSize(),
-		IsDir:   fi.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR,
-		AccTime: time.Unix(0, fi.GetResponse()[0].GetAtime()*int64(1000000)),
+		Bucket:      bucket,
+		Name:        object,
+		ETag:        r.MD5CurrentHexString(),
+		ModTime:     time.Unix(0, fi.GetResponse()[0].GetMtime()*int64(1000000)),
+		Size:        fi.GetResponse()[0].GetSize(),
+		IsDir:       fi.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR,
+		AccTime:     time.Unix(0, fi.GetResponse()[0].GetAtime()*int64(1000000)),
+		UserDefined: opts.UserDefined,
 	}, nil
 }
 
@@ -705,6 +808,7 @@ func (n *sdfsObjects) NewMultipartUpload(ctx context.Context, bucket string, obj
 	} else if fb.GetErrorCode() > 0 {
 		return uploadID, sdfsToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
+	umd := s3MetaToSdfsAttributes(opts.UserDefined)
 
 	uploadID = minio.MustGetUUID()
 	fcr, err := n.fc.MkDirAll(ctx, &spb.MkDirRequest{Path: n.sdfsPathJoin(minioMetaTmpBucket, uploadID)})
@@ -712,6 +816,28 @@ func (n *sdfsObjects) NewMultipartUpload(ctx context.Context, bucket string, obj
 		return uploadID, genericToObjectErr(ctx, err, bucket)
 	} else if fcr.GetErrorCode() > 0 {
 		return uploadID, sdfsToObjectErr(ctx, &sdfsError{err: fcr.GetError(), errorCode: fcr.GetErrorCode()}, bucket)
+	}
+	mf, err := n.fc.Mknod(ctx, &spb.MkNodRequest{Path: n.sdfsPathJoin(minioMetaTmpBucket, uploadID, "metadata")})
+	if err != nil {
+		return uploadID, genericToObjectErr(ctx, err, bucket)
+	} else if mf.GetErrorCode() > 0 {
+		if mf.ErrorCode == spb.ErrorCodes_EEXIST {
+			n.fc.Unlink(ctx, &spb.UnlinkRequest{Path: n.sdfsPathJoin(minioMetaTmpBucket, uploadID, "metadata")})
+			mf, err = n.fc.Mknod(ctx, &spb.MkNodRequest{Path: n.sdfsPathJoin(minioMetaTmpBucket, uploadID, "metadata")})
+			if err != nil {
+				return uploadID, genericToObjectErr(ctx, err, bucket)
+			} else if mf.GetErrorCode() > 0 {
+				return uploadID, sdfsToObjectErr(ctx, &sdfsError{err: mf.GetError(), errorCode: mf.GetErrorCode()}, bucket)
+			}
+		} else {
+			return uploadID, sdfsToObjectErr(ctx, &sdfsError{err: mf.GetError(), errorCode: mf.GetErrorCode()}, bucket)
+		}
+	}
+	umet, err := n.fc.SetUserMetaData(ctx, &spb.SetUserMetaDataRequest{Path: n.sdfsPathJoin(minioMetaTmpBucket, uploadID, "metadata"), FileAttributes: umd})
+	if err != nil {
+		return uploadID, genericToObjectErr(ctx, err, bucket)
+	} else if umet.GetErrorCode() > 0 {
+		return uploadID, sdfsToObjectErr(ctx, &sdfsError{err: umet.GetError(), errorCode: umet.GetErrorCode()}, bucket)
 	}
 	return uploadID, nil
 }
@@ -770,6 +896,7 @@ func (n *sdfsObjects) ListObjectParts(ctx context.Context, bucket, object, uploa
 
 func (n *sdfsObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject, uploadID string, partID int,
 	startOffset int64, length int64, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.PartInfo, error) {
+	log.Printf("reading %s %s", srcObject, dstObject)
 	fb, err := n.fc.Stat(ctx, &spb.FileInfoRequest{FileName: n.sdfsPathJoin(srcBucket)})
 	if err != nil {
 		return minio.PartInfo{}, genericToObjectErr(ctx, err, srcBucket)
@@ -786,14 +913,12 @@ func (n *sdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadI
 	} else if fb.GetErrorCode() > 0 {
 		return info, sdfsToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
-	log.Printf("1")
 	fi, err := n.fc.Stat(ctx, &spb.FileInfoRequest{FileName: n.sdfsPathJoin(minioMetaTmpBucket, uploadID)})
 	if err != nil {
 		return info, genericToObjectErr(ctx, err, bucket)
 	} else if fb.GetErrorCode() > 0 {
 		return info, sdfsToObjectErr(ctx, &sdfsError{err: fi.GetError(), errorCode: fi.GetErrorCode()}, bucket)
 	}
-	log.Printf("2")
 	filePath := n.sdfsPathJoin(minioMetaTmpBucket, uploadID, strconv.Itoa(partID))
 	fmr, err := n.fc.Mknod(ctx, &spb.MkNodRequest{Path: filePath})
 	if err != nil {
@@ -802,7 +927,7 @@ func (n *sdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadI
 		return info, sdfsToObjectErr(ctx, &sdfsError{err: fmr.GetError(), errorCode: fmr.GetErrorCode()}, bucket)
 	}
 	fhr, err := n.fc.Open(ctx, &spb.FileOpenRequest{Path: filePath})
-	offset := fi.GetResponse()[0].GetSize()
+	var offset int64 = 0
 	fh := fhr.GetFileHandle()
 	b1 := make([]byte, 128*1024)
 	var n1 int = 0
@@ -811,7 +936,6 @@ func (n *sdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadI
 	copy(s, b1)
 	fwr, err := n.fc.Write(ctx, &spb.DataWriteRequest{FileHandle: fh, Data: s, Start: offset, Len: int32(n1)})
 	offset += int64(n1)
-	log.Printf("3")
 	if err != nil {
 		n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
 		return info, genericToObjectErr(ctx, err, bucket)
@@ -819,7 +943,6 @@ func (n *sdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadI
 		n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
 		return info, sdfsToObjectErr(ctx, &sdfsError{err: fwr.GetError(), errorCode: fwr.GetErrorCode()}, bucket)
 	}
-	log.Printf("4")
 	for n1 > 0 {
 		n1, err = r.Read(b1)
 		if n1 > 0 {
@@ -836,13 +959,11 @@ func (n *sdfsObjects) PutObjectPart(ctx context.Context, bucket, object, uploadI
 			}
 		}
 	}
-	log.Printf("5")
 	n.fc.Release(ctx, &spb.FileCloseRequest{FileHandle: fh})
 	info.PartNumber = partID
 	info.ETag = r.MD5CurrentHexString()
 	info.LastModified = minio.UTCNow()
 	info.Size = r.Reader.Size()
-	log.Printf("6")
 	return info, nil
 }
 
@@ -853,9 +974,11 @@ func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 	} else if fb.GetErrorCode() > 0 {
 		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
 	}
-
-	if err = n.checkUploadIDExists(ctx, bucket, object, uploadID); err != nil {
-		return objInfo, err
+	fmb, err := n.fc.GetFileInfo(ctx, &spb.FileInfoRequest{FileName: n.sdfsPathJoin(minioMetaTmpBucket, uploadID, "metadata")})
+	if err != nil {
+		return objInfo, genericToObjectErr(ctx, err, bucket, uploadID)
+	} else if fmb.GetErrorCode() > 0 {
+		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fmb.GetError(), errorCode: fmb.GetErrorCode()}, bucket, uploadID)
 	}
 
 	var offset int64 = 0
@@ -864,10 +987,12 @@ func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 		ii, err := strconv.Atoi(fis[i].FileName)
 		if err != nil {
 			log.Printf("error reading %s", fis[i].FileName)
+			return false
 		}
 		ji, err := strconv.Atoi(fis[j].FileName)
 		if err != nil {
 			log.Printf("error reading %s", fis[j].FileName)
+			return false
 		}
 		return ii < ji
 	})
@@ -875,26 +1000,38 @@ func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 	mkt, err := n.fc.Mknod(ctx, &spb.MkNodRequest{Path: tf})
 	if err != nil {
 		return objInfo, genericToObjectErr(ctx, err, bucket)
+	} else if mkt.GetErrorCode() == spb.ErrorCodes_EEXIST {
+		ul, err := n.fc.Unlink(ctx, &spb.UnlinkRequest{Path: tf})
+		if err != nil {
+			return objInfo, genericToObjectErr(ctx, err, bucket)
+		} else if ul.GetErrorCode() > 0 {
+			return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: ul.GetError(), errorCode: ul.GetErrorCode()}, bucket)
+		}
 	} else if mkt.GetErrorCode() > 0 {
 		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: mkt.GetError(), errorCode: mkt.GetErrorCode()}, bucket)
 	}
 	for _, fl := range fis {
 		_tf := n.sdfsPathJoin(minioMetaTmpBucket, uploadID, fl.FileName)
-		sz := fl.GetSize()
-		cpx, err := n.fc.CopyExtent(ctx, &spb.CopyExtentRequest{
-			SrcFile:  _tf,
-			SrcStart: 0,
-			Length:   sz,
-			DstFile:  tf,
-			DstStart: offset,
-		})
-		if err != nil {
-			return objInfo, genericToObjectErr(ctx, err, bucket)
-		} else if cpx.GetErrorCode() > 0 {
-			return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: cpx.GetError(), errorCode: cpx.GetErrorCode()}, bucket)
+		_, err := strconv.Atoi(fl.FileName)
+		if err == nil {
+
+			sz := fl.GetSize()
+			cpx, err := n.fc.CopyExtent(ctx, &spb.CopyExtentRequest{
+				SrcFile:  _tf,
+				SrcStart: 0,
+				Length:   sz,
+				DstFile:  tf,
+				DstStart: offset,
+			})
+			if err != nil {
+				return objInfo, genericToObjectErr(ctx, err, bucket)
+			} else if cpx.GetErrorCode() > 0 {
+				return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: cpx.GetError(), errorCode: cpx.GetErrorCode()}, bucket)
+			}
+			offset += sz
 		}
 		n.fc.Unlink(ctx, &spb.UnlinkRequest{Path: _tf})
-		offset += sz
+
 	}
 
 	name := n.sdfsPathJoin(bucket, object)
@@ -904,7 +1041,7 @@ func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 		if err != nil {
 			return objInfo, genericToObjectErr(ctx, err, bucket, object)
 		}
-		if fd.GetErrorCode() > 0 {
+		if fd.GetErrorCode() > 0 && fd.GetErrorCode() != spb.ErrorCodes_EEXIST {
 			return objInfo, genericToObjectErr(ctx, &sdfsError{err: fd.GetError(), errorCode: fd.GetErrorCode()}, bucket)
 		}
 	}
@@ -913,16 +1050,19 @@ func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 		return objInfo, genericToObjectErr(ctx, err, bucket, object)
 	}
 	if fr.GetErrorCode() == spb.ErrorCodes_EEXIST {
-		_, err := n.fc.RmDir(ctx, &spb.RmDirRequest{Path: name})
+		ulf, err := n.fc.Unlink(ctx, &spb.UnlinkRequest{Path: name})
 		if err != nil {
 			if dir != "" {
 				n.deleteObject(ctx, n.sdfsPathJoin(bucket), dir)
 			}
 			return objInfo, genericToObjectErr(ctx, err, bucket, object)
-		}
-		_, err = n.fc.Rename(ctx, &spb.FileRenameRequest{Src: tf, Dest: name})
-		if err != nil {
-			return objInfo, genericToObjectErr(ctx, err, bucket, object)
+		} else if ulf.GetErrorCode() == spb.ErrorCodes_EISDIR {
+			rmd, err := n.fc.RmDir(ctx, &spb.RmDirRequest{Path: name})
+			if err != nil {
+				return objInfo, genericToObjectErr(ctx, err, bucket, object)
+			} else if rmd.GetErrorCode() > 0 {
+				return objInfo, genericToObjectErr(ctx, &sdfsError{err: rmd.GetError(), errorCode: rmd.GetErrorCode()}, bucket, object)
+			}
 		}
 		fr, err = n.fc.Rename(ctx, &spb.FileRenameRequest{Src: tf, Dest: name})
 		if err != nil {
@@ -944,15 +1084,27 @@ func (n *sdfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, objec
 
 	// Calculate s3 compatible md5sum for complete multipart.
 	s3MD5 := minio.ComputeCompleteMultipartMD5(parts)
+	if opts.UserDefined == nil {
+		opts.UserDefined = make(map[string]string)
+	}
+	fmb.GetResponse()[0].FileAttributes = append(fmb.GetResponse()[0].FileAttributes, &spb.FileAttributes{Key: "x-amz-meta-md5sum", Value: s3MD5})
+	fu, err := n.fc.SetUserMetaData(ctx, &spb.SetUserMetaDataRequest{Path: name, FileAttributes: fmb.GetResponse()[0].FileAttributes})
+	if err != nil {
+		return objInfo, genericToObjectErr(ctx, err, bucket, object)
+	} else if fu.GetErrorCode() > 0 {
+		return objInfo, sdfsToObjectErr(ctx, &sdfsError{err: fu.GetError(), errorCode: fu.GetErrorCode()}, bucket, name)
+	}
+	s3md := sdfsAttributesToS3Meta(fmb.GetResponse()[0].FileAttributes)
 
 	return minio.ObjectInfo{
-		Bucket:  bucket,
-		Name:    object,
-		ETag:    s3MD5,
-		ModTime: time.Unix(0, fi.GetResponse()[0].GetMtime()*int64(1000000)),
-		Size:    fi.GetResponse()[0].GetSize(),
-		IsDir:   fi.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR,
-		AccTime: time.Unix(0, fi.GetResponse()[0].GetAtime()*int64(1000000)),
+		Bucket:      bucket,
+		Name:        object,
+		ETag:        s3MD5,
+		UserDefined: s3md,
+		ModTime:     time.Unix(0, fi.GetResponse()[0].GetMtime()*int64(1000000)),
+		Size:        fi.GetResponse()[0].GetSize(),
+		IsDir:       fi.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR,
+		AccTime:     time.Unix(0, fi.GetResponse()[0].GetAtime()*int64(1000000)),
 	}, nil
 }
 
@@ -962,6 +1114,18 @@ func (n *sdfsObjects) AbortMultipartUpload(ctx context.Context, bucket, object, 
 		return genericToObjectErr(ctx, err, bucket)
 	} else if fb.GetErrorCode() > 0 {
 		return sdfsToObjectErr(ctx, &sdfsError{err: fb.GetError(), errorCode: fb.GetErrorCode()}, bucket)
+	}
+	fbo, err := n.fc.GetFileInfo(ctx, &spb.FileInfoRequest{FileName: n.sdfsPathJoin(minioMetaTmpBucket, uploadID)})
+	if err != nil {
+		return genericToObjectErr(ctx, err, bucket)
+	} else if fb.GetErrorCode() > 0 {
+		return sdfsToObjectErr(ctx, &sdfsError{err: fbo.GetError(), errorCode: fbo.GetErrorCode()}, bucket)
+	}
+
+	fis := fbo.GetResponse()
+	for _, fl := range fis {
+		_tf := n.sdfsPathJoin(minioMetaTmpBucket, uploadID, fl.FileName)
+		n.fc.Unlink(ctx, &spb.UnlinkRequest{Path: _tf})
 	}
 	fr, err := n.fc.RmDir(ctx, &spb.RmDirRequest{Path: n.sdfsPathJoin(minioMetaTmpBucket, uploadID)})
 	if err != nil {

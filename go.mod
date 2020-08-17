@@ -78,7 +78,7 @@ require (
 	github.com/ncw/directio v1.0.5
 	github.com/nsqio/go-nsq v1.0.7
 	github.com/olekukonko/tablewriter v0.0.0-20170122224234-a0225b3f23b5 // indirect
-	github.com/opendedup/sdfs-client-go v0.1.7
+	github.com/opendedup/sdfs-client-go v0.1.8
 	github.com/ozonru/etcd v3.3.20+incompatible
 	github.com/philhofer/fwd v1.0.0 // indirect
 	github.com/pierrec/lz4 v2.4.0+incompatible
@@ -111,7 +111,7 @@ require (
 	golang.org/x/sys v0.0.0-20200728102440-3e129f6d46b1
 	golang.org/x/text v0.3.3 // indirect
 	google.golang.org/api v0.29.0
-	google.golang.org/grpc v1.30.0
+	google.golang.org/grpc v1.31.0
 	gopkg.in/cheggaaa/pb.v1 v1.0.25 // indirect
 	gopkg.in/jcmturner/gokrb5.v7 v7.3.0
 	gopkg.in/ldap.v3 v3.0.3

@@ -43,10 +43,14 @@ import (
 )
 
 const (
-	sdfsBackend = "sdfs"
+	sdfsBackend  = "sdfs"
+	sdfsPassword = "password"
+	sdfsUserName = "admin"
 
 	sdfsSeparator = minio.SlashSeparator
 )
+
+var authtoken string
 
 func init() {
 	const sdfsGatewayTemplate = `NAME:
@@ -100,7 +104,7 @@ func clientInterceptor(
 	// Logic before invoking the invoker
 	start := time.Now()
 	// Calls the invoker to execute RPC
-	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "bearer poop")
+	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "bearer "+authtoken)
 	err := invoker(ctx, method, req, reply, cc, opts...)
 	// Logic after invoking the invoker
 	log.Printf("Invoked RPC method=%s; Duration=%s; Error=%v", method,
@@ -193,6 +197,14 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 	fc := spb.NewFileIOServiceClient(conn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	auth, err := vc.AuthenticateUser(ctx, &spb.AuthenticationRequest{Username: sdfsUserName, Password: sdfsPassword})
+	if err != nil {
+		return nil, err
+	} else if auth.GetErrorCode() > 0 && auth.GetErrorCode() != spb.ErrorCodes_EEXIST {
+		return nil, &sdfsError{err: auth.GetError(), errorCode: auth.GetErrorCode()}
+	}
+	token := auth.GetToken()
+	authtoken = token
 	defer cancel()
 	r, err := fc.MkDirAll(ctx, &spb.MkDirRequest{Path: minio.PathJoin(commonPath, sdfsSeparator, minioMetaTmpBucket)})
 	if err != nil {
@@ -201,7 +213,7 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 		return nil, &sdfsError{err: r.GetError(), errorCode: r.GetErrorCode()}
 	}
 
-	return &sdfsObjects{clnt: conn, vc: vc, fc: fc, subPath: commonPath, listPool: minio.NewTreeWalkPool(time.Minute * 30)}, nil
+	return &sdfsObjects{clnt: conn, vc: vc, fc: fc, token: token, subPath: commonPath, listPool: minio.NewTreeWalkPool(time.Minute * 30)}, nil
 }
 
 // Production - hdfs gateway is production ready.
@@ -230,6 +242,7 @@ type sdfsObjects struct {
 	clnt     *grpc.ClientConn
 	vc       spb.VolumeServiceClient
 	fc       spb.FileIOServiceClient
+	token    string
 	subPath  string
 	listPool *minio.TreeWalkPool
 }

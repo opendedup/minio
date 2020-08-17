@@ -437,6 +437,8 @@ github.com/opendedup/sdfs-client-go v0.1.6 h1:pHtT5UaOEagu3nisGBFadCVUVr1CRKh6r6
 github.com/opendedup/sdfs-client-go v0.1.6/go.mod h1:88r8dgjX0eg3HGZD5EFfqT4ub/XlSWKhj2ZsM981Adg=
 github.com/opendedup/sdfs-client-go v0.1.7 h1:4XQBodVZFE1RlJ/IZm6bfZD94Y3vD7M40FlpJ3qLhDI=
 github.com/opendedup/sdfs-client-go v0.1.7/go.mod h1:88r8dgjX0eg3HGZD5EFfqT4ub/XlSWKhj2ZsM981Adg=
+github.com/opendedup/sdfs-client-go v0.1.8 h1:He5HC9bzwuA0etyIhr8Cdr/XFFA35jhZYymLfLGu194=
+github.com/opendedup/sdfs-client-go v0.1.8/go.mod h1:ISTQkEU1a4JdPCs682Fs84AgiuRf/T0cYk+2vw1x0pU=
 github.com/ozonru/etcd v3.3.20+incompatible h1:nBP55DSxQ9A4bE8LpQaoux8Nub6bh+H+Zxzwpqfna3g=
 github.com/ozonru/etcd v3.3.20+incompatible/go.mod h1:iIubILNIN6Jq9h8uiSLrN9L1tuj3iSSFwz3R61skm/A=
 github.com/pascaldekloe/goe v0.1.0 h1:cBOtyMzM9HTpWjXfbbunk26uA6nG3a8n06Wieeh0MwY=

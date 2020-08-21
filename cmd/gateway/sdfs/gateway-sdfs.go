@@ -18,10 +18,14 @@ package sdfs
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"os/user"
 	"path"
 	"sort"
@@ -39,14 +43,12 @@ import (
 
 	spb "github.com/opendedup/sdfs-client-go/sdfs"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 )
 
 const (
-	sdfsBackend  = "sdfs"
-	sdfsPassword = "password"
-	sdfsUserName = "admin"
-
+	sdfsBackend   = "sdfs"
 	sdfsSeparator = minio.SlashSeparator
 )
 
@@ -102,20 +104,16 @@ func clientInterceptor(
 	opts ...grpc.CallOption,
 ) error {
 	// Logic before invoking the invoker
-	start := time.Now()
 	// Calls the invoker to execute RPC
 	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "bearer "+authtoken)
 	err := invoker(ctx, method, req, reply, cc, opts...)
 	// Logic after invoking the invoker
-	log.Printf("Invoked RPC method=%s; Duration=%s; Error=%v", method,
-		time.Since(start), err)
 	return err
 }
 
 func s3MetaToSdfsAttributes(meta map[string]string) []*spb.FileAttributes {
 	var attrs []*spb.FileAttributes
 	for k, v := range meta {
-		log.Printf("key = %s val = %s", k, v)
 		attrs = append(attrs, &spb.FileAttributes{Key: k, Value: v})
 	}
 	return attrs
@@ -125,7 +123,6 @@ func sdfsAttributesToS3Meta(meta []*spb.FileAttributes) map[string]string {
 
 	s3Metadata := make(map[string]string)
 	for i := range meta {
-		log.Printf("key = %s val = %s", meta[i].Key, meta[i].Value)
 		s3Metadata[meta[i].Key] = meta[i].Value
 	}
 	return s3Metadata
@@ -160,6 +157,46 @@ func (g *SDFS) Name() string {
 	return sdfsBackend
 }
 
+// A Credentials Struct
+type Credentials struct {
+	Username     string `json:"username"`
+	Password     string `json:"password"`
+	Disabletrust bool   `json:"disable_ssl_verify"`
+}
+
+func getCredentials() (username string, password string, disabletrust bool, err error) {
+	user, err := user.Current()
+	filepath := user.HomeDir + "/.sdfs/credentials.json"
+	username, uok := os.LookupEnv("SDFS_USER")
+	password, pok := os.LookupEnv("SDFS_PASSWORD")
+	_, dok := os.LookupEnv("SDFS_DISABLE_TRUST")
+	epath, eok := os.LookupEnv("SDFS_CREDENTIALS_PATH")
+	if dok {
+		disabletrust = true
+	}
+	if uok && pok {
+		return username, password, disabletrust, nil
+	} else if eok {
+		filepath = epath
+	}
+
+	jsonFile, err := os.Open(filepath)
+	if err != nil {
+		return username, password, disabletrust, err
+	}
+	// we initialize our Users array
+	var creds Credentials
+	byteValue, err := ioutil.ReadAll(jsonFile)
+	if err != nil {
+		return username, password, disabletrust, err
+	}
+	json.Unmarshal(byteValue, &creds)
+	if !dok && creds.Disabletrust {
+		disabletrust = creds.Disabletrust
+	}
+	return creds.Username, creds.Password, disabletrust, nil
+}
+
 // NewGatewayLayer returns hdfs gatewaylayer.
 func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
 
@@ -167,13 +204,17 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 	// Not addresses found, load it from command line.
 	var address string
 	var commonPath string
+	var useSSL bool
 	for _, s := range g.args {
 		u, err := xnet.ParseURL(s)
 		if err != nil {
 			return nil, err
 		}
-		if u.Scheme != "sdfs" {
-			return nil, fmt.Errorf("unsupported scheme %s, only supports sdfs://", u)
+		if !strings.HasPrefix(u.Scheme, "sdfs") {
+			return nil, fmt.Errorf("unsupported scheme %s, only supports sdfs:// or sdfss://", u)
+		}
+		if u.Scheme == "sdfss" {
+			useSSL = true
 		}
 		if commonPath != "" && commonPath != u.Path {
 			return nil, fmt.Errorf("all namenode paths should be same %s", g.args)
@@ -185,10 +226,27 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 	}
 
 	_, err := user.Current()
+	var conn *grpc.ClientConn
 	if err != nil {
 		return nil, fmt.Errorf("unable to lookup local user: %s", err)
 	}
-	conn, err := grpc.Dial(address, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithUnaryInterceptor(clientInterceptor))
+	username, password, disabletrust, err := getCredentials()
+	if err != nil {
+		return nil, fmt.Errorf("Not able to read credentials", err)
+	}
+	if useSSL == true {
+		config := &tls.Config{}
+		if disabletrust {
+			config = &tls.Config{
+				InsecureSkipVerify: true,
+			}
+		}
+		conn, err = grpc.Dial(address, grpc.WithBlock(), grpc.WithUnaryInterceptor(clientInterceptor), grpc.WithTransportCredentials(credentials.NewTLS(config)))
+
+	} else {
+		conn, err = grpc.Dial(address, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithUnaryInterceptor(clientInterceptor))
+	}
+
 	if err != nil {
 		log.Fatalf("did not connect: %v", err)
 		return nil, fmt.Errorf("unable to initialize sdfsClient")
@@ -197,7 +255,7 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 	fc := spb.NewFileIOServiceClient(conn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	auth, err := vc.AuthenticateUser(ctx, &spb.AuthenticationRequest{Username: sdfsUserName, Password: sdfsPassword})
+	auth, err := vc.AuthenticateUser(ctx, &spb.AuthenticationRequest{Username: username, Password: password})
 	if err != nil {
 		return nil, err
 	} else if auth.GetErrorCode() > 0 && auth.GetErrorCode() != spb.ErrorCodes_EEXIST {

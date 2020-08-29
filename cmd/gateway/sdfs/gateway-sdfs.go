@@ -43,8 +43,10 @@ import (
 
 	spb "github.com/opendedup/sdfs-client-go/sdfs"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -53,6 +55,8 @@ const (
 )
 
 var authtoken string
+var grpcAddress string
+var grpcSSL bool
 
 func init() {
 	const sdfsGatewayTemplate = `NAME:
@@ -105,10 +109,30 @@ func clientInterceptor(
 ) error {
 	// Logic before invoking the invoker
 	// Calls the invoker to execute RPC
-	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "bearer "+authtoken)
+	if method != "/org.opendedup.grpc.VolumeService/AuthenticateUser" {
+		_ctx := metadata.AppendToOutgoingContext(ctx, "authorization", "bearer "+authtoken)
+		err := invoker(_ctx, method, req, reply, cc, opts...)
+		if status.Code(err) == codes.Unauthenticated {
+			token, err := authenicateUser(ctx)
+			if err != nil {
+				return err
+			}
+			authtoken = token
+			_ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "bearer "+authtoken)
+			err = invoker(_ctx, method, req, reply, cc, opts...)
+			log.Printf("status code %s for method %s", status.Code(err), method)
+			return err
+
+		}
+		log.Printf("status code %s for method %s", status.Code(err), method)
+		return err
+	}
 	err := invoker(ctx, method, req, reply, cc, opts...)
-	// Logic after invoking the invoker
+	log.Printf("status code %s for method %s", status.Code(err), method)
 	return err
+
+	// Logic after invoking the invoker
+
 }
 
 func s3MetaToSdfsAttributes(meta map[string]string) []*spb.FileAttributes {
@@ -215,6 +239,7 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 		}
 		if u.Scheme == "sdfss" {
 			useSSL = true
+			grpcSSL = true
 		}
 		if commonPath != "" && commonPath != u.Path {
 			return nil, fmt.Errorf("all namenode paths should be same %s", g.args)
@@ -224,13 +249,14 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 		}
 		address = u.Host
 	}
+	grpcAddress = address
 
 	_, err := user.Current()
 	var conn *grpc.ClientConn
 	if err != nil {
 		return nil, fmt.Errorf("unable to lookup local user: %s", err)
 	}
-	username, password, disabletrust, err := getCredentials()
+	_, _, disabletrust, err := getCredentials()
 	if err != nil {
 		return nil, fmt.Errorf("Not able to read credentials", err)
 	}
@@ -255,14 +281,13 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 	fc := spb.NewFileIOServiceClient(conn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	auth, err := vc.AuthenticateUser(ctx, &spb.AuthenticationRequest{Username: username, Password: password})
-	if err != nil {
-		return nil, err
-	} else if auth.GetErrorCode() > 0 && auth.GetErrorCode() != spb.ErrorCodes_EEXIST {
-		return nil, &sdfsError{err: auth.GetError(), errorCode: auth.GetErrorCode()}
-	}
-	token := auth.GetToken()
-	authtoken = token
+	/*
+		token, err := authenicateUser(ctx)
+		if err != nil {
+			return nil, err
+		}
+		authtoken = token
+	*/
 	defer cancel()
 	r, err := fc.MkDirAll(ctx, &spb.MkDirRequest{Path: minio.PathJoin(commonPath, sdfsSeparator, minioMetaTmpBucket)})
 	if err != nil {
@@ -271,7 +296,7 @@ func (g *SDFS) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error
 		return nil, &sdfsError{err: r.GetError(), errorCode: r.GetErrorCode()}
 	}
 
-	return &sdfsObjects{clnt: conn, vc: vc, fc: fc, token: token, subPath: commonPath, listPool: minio.NewTreeWalkPool(time.Minute * 30)}, nil
+	return &sdfsObjects{clnt: conn, vc: vc, fc: fc, subPath: commonPath, listPool: minio.NewTreeWalkPool(time.Minute * 30)}, nil
 }
 
 // Production - hdfs gateway is production ready.
@@ -281,6 +306,46 @@ func (g *SDFS) Production() bool {
 
 func (n *sdfsObjects) Shutdown(ctx context.Context) error {
 	return n.clnt.Close()
+}
+
+func authenicateUser(ctx context.Context) (token string, err error) {
+	username, password, disabletrust, err := getCredentials()
+	if err != nil {
+		return token, err
+	}
+	var conn *grpc.ClientConn
+
+	if grpcSSL == true {
+		config := &tls.Config{}
+		if disabletrust {
+			config = &tls.Config{
+				InsecureSkipVerify: true,
+			}
+		}
+		conn, err = grpc.Dial(grpcAddress, grpc.WithBlock(), grpc.WithTransportCredentials(credentials.NewTLS(config)))
+
+	} else {
+		conn, err = grpc.Dial(grpcAddress, grpc.WithInsecure(), grpc.WithBlock())
+	}
+
+	if err != nil {
+		log.Fatalf("did not connect: %v", err)
+		return token, fmt.Errorf("unable to initialize sdfsClient")
+	}
+	vc := spb.NewVolumeServiceClient(conn)
+	auth, err := vc.AuthenticateUser(ctx, &spb.AuthenticationRequest{Username: username, Password: password})
+	if err != nil {
+		return token, err
+	} else if auth.GetErrorCode() > 0 && auth.GetErrorCode() != spb.ErrorCodes_EEXIST {
+		return token, &sdfsError{err: auth.GetError(), errorCode: auth.GetErrorCode()}
+	}
+	token = auth.GetToken()
+	log.Printf("found token %s", token)
+	err = conn.Close()
+	if err != nil {
+		log.Fatalf("did not connect: %v", err)
+	}
+	return token, err
 }
 
 func (n *sdfsObjects) StorageInfo(ctx context.Context, _ bool) (si minio.StorageInfo, errs []error) {
@@ -494,14 +559,30 @@ func (n *sdfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, d
 		if fl.GetResponse()[0].GetType() == spb.FileInfoResponse_DIR {
 			dir = true
 		}
-
+		metadata := sdfsAttributesToS3Meta(fl.GetResponse()[0].FileAttributes)
+		var etag string
+		var contentType string
+		var contentEncoding string
+		if val, ok := metadata["x-amz-meta-md5sum"]; ok {
+			etag = val
+		}
+		if val, ok := metadata["Content-Type"]; ok {
+			contentType = val
+		}
+		if val, ok := metadata["Content-Encoding"]; ok {
+			contentEncoding = val
+		}
 		return minio.ObjectInfo{
-			Bucket:  bucket,
-			Name:    entry,
-			Size:    fl.GetResponse()[0].GetSize(),
-			IsDir:   dir,
-			ModTime: time.Unix(0, fl.GetResponse()[0].GetMtime()*int64(1000000)),
-			AccTime: time.Unix(0, fl.GetResponse()[0].GetAtime()*int64(1000000)),
+			Bucket:          bucket,
+			Name:            entry,
+			UserDefined:     metadata,
+			Size:            fl.GetResponse()[0].GetSize(),
+			IsDir:           dir,
+			ModTime:         time.Unix(0, fl.GetResponse()[0].GetMtime()*int64(1000000)),
+			AccTime:         time.Unix(0, fl.GetResponse()[0].GetAtime()*int64(1000000)),
+			ContentType:     contentType,
+			ContentEncoding: contentEncoding,
+			ETag:            etag,
 		}, nil
 	}
 

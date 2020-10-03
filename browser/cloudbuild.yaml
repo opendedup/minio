@@ -1,0 +1,19 @@
+steps:
+- name: gcr.io/kaniko-project/executor:latest
+  args:
+    - --destination=gcr.io/$PROJECT_ID/hybrics-minio:$BRANCH_NAME
+    - --cache=true
+    - --cache-ttl=10h
+    - --target=builder
+    - --dockerfile=Dockerfile
+- name: gcr.io/cloud-builders/docker
+  entrypoint: 'bash'
+  args: [ '-c', 'docker run -v $PWD:/opt/mount --rm --entrypoint cp gcr.io/$PROJECT_ID/hybrics-minio:$BRANCH_NAME /usr/bin/minio /opt/mount/minio']
+- name: gcr.io/cloud-builders/gcloud
+  entrypoint: 'bash'
+  args: [ '-c', "gsutil cp minio gs://${_DIST_BUCKET}/minio/minio-$BRANCH_NAME" ]
+substitutions:
+  _DIST_BUCKET: abucket # default value
+timeout: 10800s
+options:
+  machineType: 'N1_HIGHCPU_32'

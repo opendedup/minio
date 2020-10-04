@@ -12,7 +12,7 @@ RUN  \
      cd /go/minio && \
      go install -v -ldflags "$(go run buildscripts/gen-ldflags.go)"
 
-FROM alpine:3.12
+FROM alpine:3.12 as run
 
 ENV MINIO_UPDATE off
 ENV MINIO_ACCESS_KEY_FILE=access_key \

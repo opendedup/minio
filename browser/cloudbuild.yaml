@@ -7,10 +7,10 @@ steps:
     - --dockerfile=Dockerfile
 - name: gcr.io/cloud-builders/docker
   entrypoint: 'bash'
-  args: [ '-c', 'docker run -v $PWD:/opt/mount --rm --entrypoint cp gcr.io/$PROJECT_ID/hybrics-minio:$BRANCH_NAME /usr/bin/minio /opt/mount/minio']
+  args: [ '-c', 'docker run -v /tmp:/opt/mount --rm --entrypoint cp gcr.io/$PROJECT_ID/hybrics-minio:$BRANCH_NAME /usr/bin/minio /opt/mount/minio']
 - name: gcr.io/cloud-builders/gcloud
   entrypoint: 'bash'
-  args: [ '-c', "gsutil cp minio gs://${_DIST_BUCKET}/minio/minio-$BRANCH_NAME" ]
+  args: [ '-c', "gsutil cp /tmp/minio gs://${_DIST_BUCKET}/minio/minio-$BRANCH_NAME" ]
 substitutions:
   _DIST_BUCKET: abucket # default value
 timeout: 10800s

@@ -15,4 +15,4 @@ substitutions:
   _DIST_BUCKET: abucket # default value
 timeout: 10800s
 options:
-  machineType: 'N1_HIGHCPU_8'
+  machineType: 'N1_HIGHCPU_32'
